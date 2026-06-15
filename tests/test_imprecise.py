@@ -23,6 +23,7 @@ from imprecise.domain_outcome import DomainOutcomeDataset  # noqa: E402
 from imprecise.relaxed_local_correctness import (  # noqa: E402
     relaxed_local_correctness_bound,
 )
+from imprecise.rough_imprecise_dm import rough_dm_bounds  # noqa: E402
 from imprecise.experiment import load_records  # noqa: E402
 from imprecise.task_execution import checkpoint_summary  # noqa: E402
 from imprecise.task_execution import selected_task_index  # noqa: E402
@@ -272,6 +273,117 @@ class ImpreciseClusteringTest(unittest.TestCase):
             result["epsilon_tv_bound"] + 1e-10,
         )
         self.assertTrue(result["bound_covers_population_bias"])
+
+    def test_rough_dm_complete_support_collapses_to_dm(self):
+        prediction = np.array(
+            [
+                [1.0, 1.2, 3.0, 2.0],
+                [2.0, 2.2, 4.0, 3.0],
+            ]
+        )
+        target = np.full((2, 4), 0.25)
+        result = rough_dm_bounds(
+            prediction=prediction,
+            target_policy=target,
+            support_mask=np.ones(4, dtype=bool),
+            action_features=np.array([[0.0], [0.2], [2.0], [1.0]]),
+            hard_labels=np.array([0, 0, 1, 1]),
+            candidates=[
+                np.array([0]),
+                np.array([0]),
+                np.array([1]),
+                np.array([0, 1]),
+            ],
+            factual_action=np.array([0, 2]),
+            factual_reward=np.array([1.0, 4.0]),
+            gamma=1.0,
+            outcome_lower=-10.0,
+            outcome_upper=10.0,
+            min_calibration_count=1,
+        )
+        expected = float(np.mean(np.sum(target * prediction, axis=1)))
+        self.assertAlmostEqual(result["lower_value"], expected)
+        self.assertAlmostEqual(result["upper_value"], expected)
+        self.assertAlmostEqual(result["interval_width"], 0.0)
+
+    def test_rough_dm_gamma_widens_supported_analogue_bounds(self):
+        prediction = np.array(
+            [
+                [1.0, 1.2, 3.0, 2.0],
+                [2.0, 2.2, 4.0, 3.0],
+            ]
+        )
+        common = dict(
+            prediction=prediction,
+            target_policy=np.array(
+                [
+                    [0.1, 0.1, 0.1, 0.7],
+                    [0.1, 0.1, 0.1, 0.7],
+                ]
+            ),
+            support_mask=np.array([True, True, True, False]),
+            action_features=np.array([[0.0], [0.2], [2.0], [1.0]]),
+            hard_labels=np.array([0, 0, 1, 1]),
+            candidates=[
+                np.array([0]),
+                np.array([0]),
+                np.array([1]),
+                np.array([0, 1]),
+            ],
+            factual_action=np.array([0, 2]),
+            factual_reward=np.array([1.0, 4.0]),
+            outcome_lower=-10.0,
+            outcome_upper=10.0,
+            calibration_quantile=0.9,
+            n_neighbors=2,
+            min_calibration_count=1,
+            expected_reward=prediction,
+        )
+        narrow = rough_dm_bounds(gamma=0.0, **common)
+        wide = rough_dm_bounds(gamma=2.0, **common)
+        self.assertLessEqual(wide["lower_value"], narrow["lower_value"])
+        self.assertGreaterEqual(wide["upper_value"], narrow["upper_value"])
+        self.assertGreater(wide["interval_width"], narrow["interval_width"])
+        self.assertLessEqual(
+            wide["interval_width"], wide["manski_width"] + 1e-12
+        )
+        self.assertEqual(narrow["unsupported_pair_coverage"], 1.0)
+
+    def test_rough_dm_accepts_context_dependent_support(self):
+        prediction = np.array(
+            [
+                [1.0, 1.2, 3.0, 2.0],
+                [2.0, 2.2, 4.0, 3.0],
+            ]
+        )
+        support = np.array(
+            [
+                [True, True, True, False],
+                [True, False, True, True],
+            ]
+        )
+        result = rough_dm_bounds(
+            prediction=prediction,
+            target_policy=np.full((2, 4), 0.25),
+            support_mask=support,
+            action_features=np.array([[0.0], [0.2], [2.0], [1.0]]),
+            hard_labels=np.array([0, 0, 1, 1]),
+            candidates=[
+                np.array([0]),
+                np.array([0]),
+                np.array([1]),
+                np.array([0, 1]),
+            ],
+            factual_action=np.array([0, 3]),
+            factual_reward=np.array([1.0, 3.0]),
+            gamma=1.0,
+            outcome_lower=-10.0,
+            outcome_upper=10.0,
+            min_calibration_count=1,
+            expected_reward=prediction,
+        )
+        self.assertGreater(result["interval_width"], 0.0)
+        self.assertEqual(result["unsupported_pair_coverage"], 1.0)
 
 
 class TaskExecutionTest(unittest.TestCase):
