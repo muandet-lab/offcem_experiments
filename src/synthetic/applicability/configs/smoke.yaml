@@ -1,0 +1,48 @@
+execution:
+  phase: phase_a_smoke
+  output_dir: /Users/cispa/Documents/OffCEM/applicability_results/smoke
+  n_seeds: 2
+  base_sample_seed: 50000
+  formal_inference: false
+
+runtime:
+  reference_seconds: 0
+  reference_n_rounds: 3000
+  reference_n_actions: 1000
+
+defaults:
+  environment_seed: 12345
+  model_seed: 24680
+  partition_seed: 13579
+  n_rounds: 600
+  dataset:
+    n_actions: 40
+    n_users: 20
+    dim_context: 6
+    n_cat_dim: 5
+    n_cat_per_dim: 3
+    n_unobserved_cat_dim: 1
+    n_clusters: 4
+    gen_clustering_method: feature_bucket
+    cluster_balance: natural
+    cluster_temperature: 10.0
+  reward:
+    alpha: [0.40, 0.30, 0.20, 0.10]
+    feature_nonlinearity: 0.25
+    scale: 2.0
+    noise_std: 1.0
+  policies:
+    behavior_beta: -0.1
+    target_epsilon: 0.2
+    deficient_action_fraction: 0.0
+  partitions:
+    - method: matched
+    - method: corrupt
+      probability: 0.5
+    - method: kmeans
+
+design:
+  type: explicit
+  points:
+    - {}
+

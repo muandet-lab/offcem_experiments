@@ -1,0 +1,73 @@
+execution:
+  phase: phase_b_screening
+  output_dir: /Users/cispa/Documents/OffCEM/applicability_results/screening
+  n_seeds: 5
+  base_sample_seed: 50000
+  formal_inference: false
+
+# Replace reference_seconds after timing Phase A corners. The dry-run estimate
+# scales this reference approximately by n_rounds * n_actions * partitions.
+runtime:
+  reference_seconds: 0
+  reference_n_rounds: 3000
+  reference_n_actions: 1000
+
+defaults:
+  environment_seed: 12345
+  model_seed: 24680
+  partition_seed: 13579
+  n_rounds: 3000
+  dataset:
+    n_actions: 1000
+    n_users: 200
+    dim_context: 10
+    n_cat_dim: 10
+    n_cat_per_dim: 5
+    n_unobserved_cat_dim: 2
+    n_clusters: 50
+    gen_clustering_method: feature_bucket
+    cluster_balance: natural
+    cluster_temperature: 10.0
+  reward:
+    alpha: [0.25, 0.25, 0.25, 0.25]
+    feature_nonlinearity: 0.5
+    scale: 3.0
+    noise_std: 3.0
+  policies:
+    behavior_beta: -0.1
+    target_epsilon: 0.2
+    deficient_action_fraction: 0.0
+  partitions:
+    - method: matched
+    - method: corrupt
+      probability: 0.25
+    - method: corrupt
+      probability: 0.75
+    - method: feature_bucket
+    - method: kmeans
+    - method: random
+
+design:
+  type: sobol
+  n_cells: 256
+  seed: 20260610
+  sample_reward_simplex: true
+  factors:
+    n_rounds:
+      values: [1000, 10000]
+    dataset.n_actions:
+      values: [200, 2000]
+    dataset.n_clusters:
+      values: [10, 100]
+    dataset.cluster_balance:
+      values: [natural, power_law]
+    reward.noise_std:
+      values: [1.0, 5.0]
+    reward.feature_nonlinearity:
+      min: 0.0
+      max: 1.0
+    policies.target_epsilon:
+      values: [0.0, 0.7]
+    policies.deficient_action_fraction:
+      values: [0.0, 0.3]
+

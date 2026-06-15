@@ -1,0 +1,61 @@
+execution:
+  phase: phase_c_confirmation
+  output_dir: /Users/cispa/Documents/OffCEM/applicability_results/confirmation
+  n_seeds: 30
+  base_sample_seed: 70000
+  formal_inference: true
+  bootstrap_samples: 10000
+  alpha: 0.05
+  minimum_relative_effect: 0.10
+
+runtime:
+  reference_seconds: 0
+  reference_n_rounds: 3000
+  reference_n_actions: 1000
+
+defaults:
+  environment_seed: 12345
+  model_seed: 24680
+  partition_seed: 13579
+  n_rounds: 3000
+  dataset:
+    n_actions: 1000
+    n_users: 200
+    dim_context: 10
+    n_cat_dim: 10
+    n_cat_per_dim: 5
+    n_unobserved_cat_dim: 2
+    n_clusters: 50
+    gen_clustering_method: feature_bucket
+    cluster_balance: natural
+    cluster_temperature: 10.0
+  reward:
+    alpha: [0.25, 0.25, 0.25, 0.25]
+    feature_nonlinearity: 0.5
+    scale: 3.0
+    noise_std: 3.0
+  policies:
+    behavior_beta: -0.1
+    target_epsilon: 0.2
+    deficient_action_fraction: 0.0
+  partitions:
+    - method: matched
+    - method: corrupt
+      probability: 0.75
+    - method: kmeans
+
+# Replace these examples with crossover/boundary cells selected in Phase B.
+design:
+  type: explicit
+  points:
+    - reward:
+        alpha: [0.60, 0.20, 0.10, 0.10]
+      policies:
+        target_epsilon: 0.7
+        deficient_action_fraction: 0.3
+    - reward:
+        alpha: [0.10, 0.60, 0.20, 0.10]
+      n_rounds: 10000
+      policies:
+        target_epsilon: 0.2
+

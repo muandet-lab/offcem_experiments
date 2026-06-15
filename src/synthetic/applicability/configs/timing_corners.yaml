@@ -1,0 +1,63 @@
+execution:
+  phase: phase_a_timing
+  output_dir: /Users/cispa/Documents/OffCEM/applicability_results/timing_corners
+  n_seeds: 1
+  base_sample_seed: 49000
+  formal_inference: false
+
+runtime:
+  reference_seconds: 0
+  reference_n_rounds: 3000
+  reference_n_actions: 1000
+
+defaults:
+  environment_seed: 12345
+  model_seed: 24680
+  partition_seed: 13579
+  n_rounds: 1000
+  dataset:
+    n_actions: 200
+    n_users: 200
+    dim_context: 10
+    n_cat_dim: 10
+    n_cat_per_dim: 5
+    n_unobserved_cat_dim: 2
+    n_clusters: 10
+    gen_clustering_method: feature_bucket
+    cluster_balance: natural
+    cluster_temperature: 10.0
+  reward:
+    alpha: [0.25, 0.25, 0.25, 0.25]
+    feature_nonlinearity: 0.5
+    scale: 3.0
+    noise_std: 3.0
+  policies:
+    behavior_beta: -0.1
+    target_epsilon: 0.2
+    deficient_action_fraction: 0.0
+  partitions:
+    - method: matched
+    - method: corrupt
+      probability: 0.75
+    - method: kmeans
+
+design:
+  type: explicit
+  points:
+    - n_rounds: 1000
+      dataset:
+        n_actions: 200
+        n_clusters: 10
+    - n_rounds: 1000
+      dataset:
+        n_actions: 2000
+        n_clusters: 100
+    - n_rounds: 10000
+      dataset:
+        n_actions: 200
+        n_clusters: 10
+    - n_rounds: 10000
+      dataset:
+        n_actions: 2000
+        n_clusters: 100
+

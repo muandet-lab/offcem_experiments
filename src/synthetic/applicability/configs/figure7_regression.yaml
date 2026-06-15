@@ -1,0 +1,50 @@
+execution:
+  phase: phase_a_figure7_regression
+  output_dir: /Users/cispa/Documents/OffCEM/applicability_results/figure7_regression
+  n_seeds: 300
+  base_sample_seed: 50000
+  formal_inference: false
+
+runtime:
+  reference_seconds: 0
+  reference_n_rounds: 3000
+  reference_n_actions: 1000
+
+defaults:
+  generator: legacy_figure7
+  environment_seed: 12345
+  model_seed: 12345
+  partition_seed: 13579
+  n_rounds: 3000
+  n_test_rounds: 100000
+  n_test_users: 1000
+  dataset:
+    n_actions: 1000
+    n_users: 200
+    dim_context: 10
+    n_cat_dim: 10
+    n_cat_per_dim: 5
+    latent_param_mat_dim: 5
+    n_clusters: 50
+  reward:
+    noise_std: 3.0
+  policies:
+    behavior_beta: -0.1
+    target_epsilon: 0.2
+  partitions:
+    - method: matched
+
+design:
+  type: explicit
+  points:
+    - dataset:
+        n_clusters: 10
+    - dataset:
+        n_clusters: 30
+    - dataset:
+        n_clusters: 50
+    - dataset:
+        n_clusters: 100
+    - dataset:
+        n_clusters: 200
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Handoff"
+  short_description: "Save or restore concise project continuity"
+  default_prompt: "Use $session-handoff to save or restore this project's handoff."
