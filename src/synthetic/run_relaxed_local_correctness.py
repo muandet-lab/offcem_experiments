@@ -1,5 +1,6 @@
 """Controlled rough-OffCEM experiment under approximate local correctness."""
 import argparse
+import json
 from pathlib import Path
 import traceback
 import warnings
@@ -20,6 +21,11 @@ from imprecise.relaxed_local_correctness import (
     relaxed_local_correctness_bound,
 )
 from imprecise.relaxed_local_correctness import summarize_relaxed_records
+from imprecise.task_execution import add_task_arguments
+from imprecise.task_execution import checkpoint_summary
+from imprecise.task_execution import print_checkpoint_summary
+from imprecise.task_execution import selected_task_index
+from imprecise.task_execution import validate_task_arguments
 
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
@@ -70,11 +76,13 @@ def parse_args():
     )
     parser.add_argument("--analyze-only", action="store_true")
     parser.add_argument("--quick", action="store_true")
+    add_task_arguments(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    validate_task_arguments(args)
     if args.quick:
         args.ambiguity_fractions = "0.0,0.5"
         args.rough_ratios = "1.1"
@@ -100,41 +108,97 @@ def main():
         for rough_ratio in rough_ratios
         for seed in range(args.n_seeds)
     ]
+    if args.print_task_count:
+        print(len(cells))
+        return
+
+    task_index = selected_task_index(args, len(cells))
+    checkpoint_paths = [
+        checkpoint_dir / _checkpoint_name(*cell)
+        for cell in cells
+    ]
+    if args.status_only:
+        print_checkpoint_summary(
+            checkpoint_summary(checkpoint_paths, _failure_count)
+        )
+        return
+
+    if task_index is not None:
+        _run_tasks(
+            args,
+            [cells[task_index]],
+            checkpoint_dir,
+            task_label=f"task {task_index}/{len(cells) - 1}",
+        )
+        path = checkpoint_paths[task_index]
+        with open(path) as file:
+            record = json.load(file)
+        if _failure_count(record):
+            raise SystemExit(1)
+        return
 
     if not args.analyze_only:
-        with tqdm(cells, desc="Relaxed local correctness", unit="fit") as bar:
-            for ambiguity, rough_ratio, seed in bar:
-                bar.set_postfix_str(
-                    f"ambiguity={ambiguity:g} ratio={rough_ratio:g} seed={seed}"
-                )
-                checkpoint = checkpoint_dir / (
-                    f"ambiguity-{ambiguity:g}_ratio-{rough_ratio:g}_"
-                    f"seed{seed:04d}.json"
-                )
-                if checkpoint.exists():
-                    continue
-                record = _run_cell(
-                    args,
-                    ambiguity_fraction=ambiguity,
-                    rough_ratio=rough_ratio,
-                    seed=seed,
-                )
-                write_json_atomic(checkpoint, record)
+        _run_tasks(args, cells, checkpoint_dir)
 
-    records = load_records(output)
+    status = checkpoint_summary(checkpoint_paths, _failure_count)
+    print_checkpoint_summary(status)
+    if args.analyze_only and not args.allow_incomplete and (
+        status["missing"] or status["error"]
+    ):
+        raise SystemExit(
+            "Refusing to analyze incomplete results. Retry missing/failed "
+            "tasks or pass --allow-incomplete."
+        )
+
+    records = load_records(
+        output,
+        checkpoint_names={path.name for path in checkpoint_paths},
+    )
     if not records:
         raise SystemExit(f"No checkpoints found in {output}")
     summary = summarize_relaxed_records(records, output)
     write_json_atomic(output / "analysis_summary.json", summary)
-    failures = sum("error" in record for record in records)
-    failures += sum(
-        "error" in partition
-        for record in records
-        for partition in record.get("partitions", [])
-    )
+    failures = sum(_failure_count(record) for record in records)
     print(
         f"wrote relaxed-local-correctness analysis from {len(records)} fits; "
         f"failures={failures}"
+    )
+
+
+def _run_tasks(args, cells, checkpoint_dir, task_label=None):
+    description = "Relaxed local correctness"
+    if task_label:
+        description = f"{description} ({task_label})"
+    with tqdm(cells, desc=description, unit="fit") as bar:
+        for ambiguity, rough_ratio, seed in bar:
+            bar.set_postfix_str(
+                f"ambiguity={ambiguity:g} ratio={rough_ratio:g} seed={seed}"
+            )
+            checkpoint = checkpoint_dir / _checkpoint_name(
+                ambiguity, rough_ratio, seed
+            )
+            if checkpoint.exists():
+                continue
+            record = _run_cell(
+                args,
+                ambiguity_fraction=ambiguity,
+                rough_ratio=rough_ratio,
+                seed=seed,
+            )
+            write_json_atomic(checkpoint, record)
+
+
+def _checkpoint_name(ambiguity, rough_ratio, seed):
+    return (
+        f"ambiguity-{ambiguity:g}_ratio-{rough_ratio:g}_"
+        f"seed{seed:04d}.json"
+    )
+
+
+def _failure_count(record):
+    return int("error" in record) + sum(
+        "error" in partition
+        for partition in record.get("partitions", [])
     )
 
 

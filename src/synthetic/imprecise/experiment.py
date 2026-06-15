@@ -363,9 +363,14 @@ def summarize_direction6(records: Iterable[Dict], output_dir: Path):
     )
 
 
-def load_records(output_dir: Path) -> List[Dict]:
+def load_records(
+    output_dir: Path,
+    checkpoint_names=None,
+) -> List[Dict]:
     records = []
     for path in sorted((output_dir / "checkpoints").glob("*.json")):
+        if checkpoint_names is not None and path.name not in checkpoint_names:
+            continue
         with open(path) as file:
             records.append(json.load(file))
     return records

@@ -1,5 +1,6 @@
 """Compare feature, domain, and outcome-aware partitions for OffCEM."""
 import argparse
+import json
 from pathlib import Path
 import traceback
 import warnings
@@ -18,6 +19,11 @@ from imprecise.domain_outcome import summarize_domain_outcome
 from imprecise.experiment import evaluate_partition
 from imprecise.experiment import load_records
 from imprecise.experiment import write_json_atomic
+from imprecise.task_execution import add_task_arguments
+from imprecise.task_execution import checkpoint_summary
+from imprecise.task_execution import print_checkpoint_summary
+from imprecise.task_execution import selected_task_index
+from imprecise.task_execution import validate_task_arguments
 
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
@@ -71,11 +77,13 @@ def parse_args():
     )
     parser.add_argument("--analyze-only", action="store_true")
     parser.add_argument("--quick", action="store_true")
+    add_task_arguments(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    validate_task_arguments(args)
     if args.quick:
         args.domain_alignments = "0.0,1.0"
         args.domain_label_noise = "0.0"
@@ -108,42 +116,98 @@ def main():
         for noise in noise_levels
         for seed in range(args.n_seeds)
     ]
+    if args.print_task_count:
+        print(len(cells))
+        return
+
+    task_index = selected_task_index(args, len(cells))
+    checkpoint_paths = [
+        checkpoint_dir / _checkpoint_name(*cell)
+        for cell in cells
+    ]
+    if args.status_only:
+        print_checkpoint_summary(
+            checkpoint_summary(checkpoint_paths, _failure_count)
+        )
+        return
+
+    if task_index is not None:
+        _run_tasks(
+            args,
+            [cells[task_index]],
+            checkpoint_dir,
+            methods,
+            task_label=f"task {task_index}/{len(cells) - 1}",
+        )
+        path = checkpoint_paths[task_index]
+        with open(path) as file:
+            record = json.load(file)
+        if _failure_count(record):
+            raise SystemExit(1)
+        return
 
     if not args.analyze_only:
-        with tqdm(cells, desc="Domain/outcome", unit="cell") as progress:
-            for alignment, noise, seed in progress:
-                progress.set_postfix_str(
-                    f"alignment={alignment:g} noise={noise:g} seed={seed}"
-                )
-                checkpoint = checkpoint_dir / (
-                    f"alignment-{alignment:g}_noise-{noise:g}_"
-                    f"seed{seed:04d}.json"
-                )
-                if checkpoint.exists():
-                    continue
-                record = _run_cell(
-                    args,
-                    domain_alignment=alignment,
-                    domain_label_noise=noise,
-                    seed=seed,
-                    methods=methods,
-                )
-                write_json_atomic(checkpoint, record)
+        _run_tasks(args, cells, checkpoint_dir, methods)
 
-    records = load_records(output)
+    status = checkpoint_summary(checkpoint_paths, _failure_count)
+    print_checkpoint_summary(status)
+    if args.analyze_only and not args.allow_incomplete and (
+        status["missing"] or status["error"]
+    ):
+        raise SystemExit(
+            "Refusing to analyze incomplete results. Retry missing/failed "
+            "tasks or pass --allow-incomplete."
+        )
+
+    records = load_records(
+        output,
+        checkpoint_names={path.name for path in checkpoint_paths},
+    )
     if not records:
         raise SystemExit(f"No checkpoints found in {output}")
     summary = summarize_domain_outcome(records, output)
     write_json_atomic(output / "analysis_summary.json", summary)
-    failures = sum("error" in record for record in records)
-    failures += sum(
-        "error" in method
-        for record in records
-        for method in record.get("methods", [])
-    )
+    failures = sum(_failure_count(record) for record in records)
     print(
         f"wrote domain/outcome analysis from {len(records)} cells; "
         f"failures={failures}"
+    )
+
+
+def _run_tasks(args, cells, checkpoint_dir, methods, task_label=None):
+    description = "Domain/outcome"
+    if task_label:
+        description = f"{description} ({task_label})"
+    with tqdm(cells, desc=description, unit="cell") as progress:
+        for alignment, noise, seed in progress:
+            progress.set_postfix_str(
+                f"alignment={alignment:g} noise={noise:g} seed={seed}"
+            )
+            checkpoint = checkpoint_dir / _checkpoint_name(
+                alignment, noise, seed
+            )
+            if checkpoint.exists():
+                continue
+            record = _run_cell(
+                args,
+                domain_alignment=alignment,
+                domain_label_noise=noise,
+                seed=seed,
+                methods=methods,
+            )
+            write_json_atomic(checkpoint, record)
+
+
+def _checkpoint_name(alignment, noise, seed):
+    return (
+        f"alignment-{alignment:g}_noise-{noise:g}_"
+        f"seed{seed:04d}.json"
+    )
+
+
+def _failure_count(record):
+    return int("error" in record) + sum(
+        "error" in method for method in record.get("methods", [])
     )
 
 

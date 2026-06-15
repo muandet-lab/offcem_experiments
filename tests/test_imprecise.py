@@ -1,6 +1,11 @@
 import sys
 from pathlib import Path
+import argparse
+import json
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,6 +23,11 @@ from imprecise.domain_outcome import DomainOutcomeDataset  # noqa: E402
 from imprecise.relaxed_local_correctness import (  # noqa: E402
     relaxed_local_correctness_bound,
 )
+from imprecise.experiment import load_records  # noqa: E402
+from imprecise.task_execution import checkpoint_summary  # noqa: E402
+from imprecise.task_execution import selected_task_index  # noqa: E402
+import run_domain_outcome_clustering as domain_runner  # noqa: E402
+import run_relaxed_local_correctness as relaxed_runner  # noqa: E402
 
 
 class ImpreciseClusteringTest(unittest.TestCase):
@@ -262,6 +272,129 @@ class ImpreciseClusteringTest(unittest.TestCase):
             result["epsilon_tv_bound"] + 1e-10,
         )
         self.assertTrue(result["bound_covers_population_bias"])
+
+
+class TaskExecutionTest(unittest.TestCase):
+    @staticmethod
+    def _task_args(**overrides):
+        values = {
+            "task_index": None,
+            "print_task_count": False,
+            "analyze_only": False,
+            "status_only": False,
+            "no_task_env": False,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_task_index_uses_explicit_value_or_environment(self):
+        self.assertEqual(
+            selected_task_index(
+                self._task_args(task_index=3),
+                n_tasks=5,
+            ),
+            3,
+        )
+        with patch.dict(os.environ, {"OFFCEM_TASK_INDEX": "2"}):
+            self.assertEqual(
+                selected_task_index(self._task_args(), n_tasks=5),
+                2,
+            )
+        with self.assertRaises(SystemExit):
+            selected_task_index(
+                self._task_args(task_index=5),
+                n_tasks=5,
+            )
+
+    def test_checkpoint_status_and_record_filtering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            checkpoints = output / "checkpoints"
+            checkpoints.mkdir()
+            good = checkpoints / "good.json"
+            bad = checkpoints / "bad.json"
+            missing = checkpoints / "missing.json"
+            stale = checkpoints / "stale.json"
+            good.write_text(json.dumps({"failures": 0}))
+            bad.write_text(json.dumps({"failures": 2}))
+            stale.write_text(json.dumps({"stale": True}))
+
+            summary = checkpoint_summary(
+                [good, bad, missing],
+                lambda record: record["failures"],
+            )
+            self.assertEqual(
+                (summary["ok"], summary["error"], summary["missing"]),
+                (1, 1, 1),
+            )
+            records = load_records(
+                output,
+                checkpoint_names={"good.json", "bad.json"},
+            )
+            self.assertEqual(len(records), 2)
+            self.assertFalse(any(record.get("stale") for record in records))
+
+    def test_domain_task_writes_checkpoint_without_aggregation(self):
+        record = {"methods": []}
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = [
+                "run_domain_outcome_clustering",
+                "--domain-alignments",
+                "0.5",
+                "--domain-label-noise",
+                "0.25",
+                "--n-seeds",
+                "1",
+                "--task-index",
+                "0",
+                "--out-dir",
+                directory,
+            ]
+            with patch.object(sys, "argv", arguments), patch.object(
+                domain_runner,
+                "_run_cell",
+                return_value=record,
+            ), patch.object(
+                domain_runner,
+                "summarize_domain_outcome",
+            ) as summarize:
+                domain_runner.main()
+            summarize.assert_not_called()
+            checkpoints = list(
+                (Path(directory) / "checkpoints").glob("*.json")
+            )
+            self.assertEqual(len(checkpoints), 1)
+
+    def test_relaxed_task_writes_checkpoint_without_aggregation(self):
+        record = {"partitions": []}
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = [
+                "run_relaxed_local_correctness",
+                "--ambiguity-fractions",
+                "0.5",
+                "--rough-ratios",
+                "1.25",
+                "--n-seeds",
+                "1",
+                "--task-index",
+                "0",
+                "--out-dir",
+                directory,
+            ]
+            with patch.object(sys, "argv", arguments), patch.object(
+                relaxed_runner,
+                "_run_cell",
+                return_value=record,
+            ), patch.object(
+                relaxed_runner,
+                "summarize_relaxed_records",
+            ) as summarize:
+                relaxed_runner.main()
+            summarize.assert_not_called()
+            checkpoints = list(
+                (Path(directory) / "checkpoints").glob("*.json")
+            )
+            self.assertEqual(len(checkpoints), 1)
 
 
 if __name__ == "__main__":
