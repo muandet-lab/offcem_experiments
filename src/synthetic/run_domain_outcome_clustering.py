@@ -104,9 +104,6 @@ def main():
         args.reward_std = 1.0
         args.out_dir = str(Path(args.out_dir) / "quick")
 
-    output = Path(args.out_dir)
-    checkpoint_dir = output / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     alignments = _float_csv(args.domain_alignments)
     noise_levels = _float_csv(args.domain_label_noise)
     methods = _split_csv(args.methods)
@@ -120,6 +117,9 @@ def main():
         print(len(cells))
         return
 
+    output = Path(args.out_dir)
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     task_index = selected_task_index(args, len(cells))
     checkpoint_paths = [
         checkpoint_dir / _checkpoint_name(*cell)

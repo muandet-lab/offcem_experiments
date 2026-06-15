@@ -97,9 +97,6 @@ def main():
         args.reward_std = 1.0
         args.out_dir = str(Path(args.out_dir) / "quick")
 
-    output = Path(args.out_dir)
-    checkpoint_dir = output / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ambiguity_levels = _float_csv(args.ambiguity_fractions)
     rough_ratios = _float_csv(args.rough_ratios)
     cells = [
@@ -112,6 +109,9 @@ def main():
         print(len(cells))
         return
 
+    output = Path(args.out_dir)
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     task_index = selected_task_index(args, len(cells))
     checkpoint_paths = [
         checkpoint_dir / _checkpoint_name(*cell)
