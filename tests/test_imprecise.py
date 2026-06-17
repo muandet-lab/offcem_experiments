@@ -23,6 +23,9 @@ from imprecise.domain_outcome import DomainOutcomeDataset  # noqa: E402
 from imprecise.relaxed_local_correctness import (  # noqa: E402
     relaxed_local_correctness_bound,
 )
+from imprecise.relaxed_local_correctness import (  # noqa: E402
+    summarize_relaxed_records,
+)
 from imprecise.rough_imprecise_dm import rough_dm_bounds  # noqa: E402
 from imprecise.experiment import load_records  # noqa: E402
 from imprecise.task_execution import checkpoint_summary  # noqa: E402
@@ -273,6 +276,53 @@ class ImpreciseClusteringTest(unittest.TestCase):
             result["epsilon_tv_bound"] + 1e-10,
         )
         self.assertTrue(result["bound_covers_population_bias"])
+
+    def test_relaxed_robust_interval_excludes_oracle_control(self):
+        def partition(source, value, bound):
+            return {
+                "source": source,
+                "draw": 0,
+                "estimate": value,
+                "ari_primary": 1.0,
+                "diagnostics": {
+                    "dm_2s": 0.0,
+                    "dm_policy_weighted": 0.0,
+                },
+                "relaxed_bound": {
+                    "population_offcem_value": value,
+                    "population_true_value": 0.0,
+                    "population_bias": value,
+                    "epsilon_tv_bound": bound,
+                    "bound_covers_population_bias": abs(value) <= bound,
+                    "required_epsilon_fraction": (
+                        abs(value) / bound if bound else 0.0
+                    ),
+                    "target_weighted_epsilon": 0.0,
+                    "target_weighted_tv": 0.0,
+                },
+            }
+
+        records = [
+            {
+                "ambiguity_fraction": 0.5,
+                "rough_ratio": 1.25,
+                "seed": 0,
+                "rough_uncertainty": {},
+                "partitions": [
+                    partition("rough_hard", 1.0, 2.0),
+                    partition("rough_sample", -1.0, 2.0),
+                    partition("oracle_primary", 100.0, 200.0),
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            summary = summarize_relaxed_records(
+                records, Path(directory)
+            )
+        robust = summary["robust"][0]
+        self.assertEqual(robust["n_partitions"], 2)
+        self.assertAlmostEqual(robust["robust_lower"], -3.0)
+        self.assertAlmostEqual(robust["robust_upper"], 3.0)
 
     def test_rough_dm_complete_support_collapses_to_dm(self):
         prediction = np.array(

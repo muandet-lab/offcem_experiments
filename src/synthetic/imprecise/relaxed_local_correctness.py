@@ -157,24 +157,31 @@ def summarize_relaxed_records(
                 )
             partition_rows.append(row)
 
-        if valid:
+        admissible = [
+            partition
+            for partition in valid
+            if partition["source"] in {"rough_hard", "rough_sample"}
+        ]
+        if admissible:
             lower = min(
                 item["relaxed_bound"]["population_offcem_value"]
                 - item["relaxed_bound"]["epsilon_tv_bound"]
-                for item in valid
+                for item in admissible
             )
             upper = max(
                 item["relaxed_bound"]["population_offcem_value"]
                 + item["relaxed_bound"]["epsilon_tv_bound"]
-                for item in valid
+                for item in admissible
             )
-            true_value = valid[0]["relaxed_bound"]["population_true_value"]
+            true_value = admissible[0]["relaxed_bound"][
+                "population_true_value"
+            ]
             robust_rows.append(
                 {
                     "ambiguity_fraction": record["ambiguity_fraction"],
                     "rough_ratio": record["rough_ratio"],
                     "seed": record["seed"],
-                    "n_partitions": len(valid),
+                    "n_partitions": len(admissible),
                     "robust_lower": lower,
                     "robust_upper": upper,
                     "robust_width": upper - lower,

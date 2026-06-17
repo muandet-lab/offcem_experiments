@@ -62,7 +62,7 @@ def parse_args():
     p.add_argument(
         "--n-clusters",
         type=str,
-        default="10,30,50,100,200",
+        default="10,20,30,40,50,75,100,150,200",
     )
     p.add_argument(
         "--methods",
@@ -104,11 +104,12 @@ def make_dataset():
     )
 
 
-def compute_policy_value(dataset, gen_method, gen_balance):
+def compute_policy_value(dataset, gen_method, gen_balance, n_clusters):
     C = DEFAULTS
     test_data = dataset.obtain_batch_bandit_feedback(
         n_rounds=C["N_TEST_DATA"],
         n_users=C["N_TEST_USERS"],
+        n_clusters=n_clusters,
         clustering_method=gen_method,
         cluster_balance=gen_balance,
     )
@@ -156,7 +157,12 @@ def run_matched(args):
                 t0 = time()
 
                 dataset = make_dataset()
-                policy_value = compute_policy_value(dataset, method, balance)
+                policy_value = compute_policy_value(
+                    dataset,
+                    method,
+                    balance,
+                    n_clusters,
+                )
 
                 estimated_policy_value_list = []
                 for seed_idx in tqdm(range(args.n_seeds), desc=combo_key):
@@ -222,7 +228,12 @@ def run_mismatched(args):
         t0 = time()
 
         dataset = make_dataset()
-        policy_value = compute_policy_value(dataset, "original", "natural")
+        policy_value = compute_policy_value(
+            dataset,
+            "original",
+            "natural",
+            n_clusters,
+        )
 
         all_estimated = []
         for seed_idx in tqdm(range(args.n_seeds), desc=f"mismatched nc={n_clusters}"):

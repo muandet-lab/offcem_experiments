@@ -1,0 +1,983 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[strings]{underscore}
+\usepackage[hidelinks]{hyperref}
+
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+\newcommand{\OffCEM}{\textsc{OffCEM}}
+\newcommand{\IPS}{\textsc{IPS}}
+\newcommand{\MIPS}{\textsc{MIPS}}
+\newcommand{\DM}{\textsc{DM}}
+\newcommand{\DR}{\textsc{DR}}
+\newcommand{\SNIPS}{\textsc{SNIPS}}
+\newcommand{\relMSE}{\mathrm{relMSE}}
+\newcommand{\relBias}{\mathrm{relBias}^2}
+\newcommand{\relVar}{\mathrm{relVar}}
+\newcommand{\dm}{\mathrm{dm}}
+
+\title{OffCEM Experimental Setup and Completed Experiments}
+\author{OffCEM extension workspace}
+\date{Compiled from workspace notes, 2026-06-17}
+
+\begin{document}
+\maketitle
+
+\section{Scope and Sources}
+
+This document summarizes the experimental setup and the experiments with results
+currently recorded in the OffCEM extension workspace. It is based on the local
+markdown notes and result write-ups, especially:
+
+\begin{itemize}
+  \item \texttt{icml2023-offcem-expts/handoff.md}
+  \item \texttt{icml2023-offcem-expts/experimental_setup.md}
+  \item \texttt{icml2023-offcem-expts/README.md}
+  \item \texttt{local_correctness_results/local_correctness_findings.md}
+  \item \texttt{clustering_results/clustering_experiment_findings.md}
+  \item \texttt{imprecise_results/imprecise_findings.md}
+  \item \texttt{icml2023-offcem-expts/src/synthetic/applicability/README.md}
+  \item \texttt{icml2023-offcem-expts/src/synthetic/imprecise/README.md}
+  \item \texttt{imprecise_clustering_methods.md}
+  \item \texttt{offcem_paper_breakdown.md}
+\end{itemize}
+
+Prepared-only manifests and planned runs are intentionally not listed as
+completed experiments. When older results are known to have been produced by
+superseded code, this is stated explicitly.
+
+\section{Experimental Setup}
+
+\subsection{Research Question}
+
+The base paper studies off-policy evaluation (OPE) for contextual bandits with a
+large discrete action set. A logging policy $\pi_0$ generated a dataset
+$\mathcal{D} = \{(x_i,a_i,r_i)\}_{i=1}^n$, and the goal is to estimate the value
+of a target policy $\pi$,
+\[
+  V(\pi) = \mathbb{E}_{p(x)\pi(a\mid x)}[q(x,a)],
+  \qquad
+  q(x,a) = \mathbb{E}[r\mid x,a].
+\]
+The OffCEM extension work asks how the action clustering used by \OffCEM{}
+affects bias, variance, local correctness, and whether OffCEM beats standard OPE
+baselines.
+
+\subsection{Software Environment}
+
+Experiments are run in the \texttt{offcem} conda environment with Python 3.9 and
+OBP 0.5.5. The base environment is not suitable because it has an incompatible
+OBP version. Synthetic modules are run from:
+\[
+  \texttt{icml2023-offcem-expts/src/synthetic}.
+\]
+The preferred command shape is:
+\[
+  \texttt{conda run -n offcem python -m <module> ...}
+\]
+Long experiment sweeps are controlled manually; the notes permit quick smoke
+tests, syntax checks, focused unit tests, and analysis-only commands.
+
+\subsection{Default Synthetic Bandit World}
+
+The default benchmark is a fully synthetic contextual bandit environment. It is
+used because the true policy value can be computed and compared against OPE
+estimates.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Parameter & Default value \\
+\midrule
+Number of logged rounds $n$ & 3000 \\
+Training users in original synthetic setup & 200 \\
+Ground-truth test rounds & 100000 \\
+Number of actions & 1000 \\
+Context dimension & 10 \\
+Action embedding dimension & 10 categorical dimensions \\
+Action embedding cardinality & 5 values per categorical dimension \\
+Number of observed clusters & 50 by default \\
+Number of unobserved categorical dimensions & 0 \\
+Reward noise standard deviation & 3.0 \\
+Logging-policy parameter $\beta$ & -0.1 \\
+Target-policy exploration $\epsilon$ & 0.2 \\
+Deficient actions & 0 in the default setting \\
+Test users in code & 1000 \\
+Default synthetic random state & 12345 \\
+\bottomrule
+\end{tabular}
+\caption{Default synthetic setup recorded in the workspace notes. The notes flag
+one paper/code discrepancy: \texttt{N\_TEST\_USERS}=1000 in code versus 200 in
+the paper. This affects ground-truth computation only, not logged OPE data.}
+\end{table}
+
+Each context $x\in\mathbb{R}^{10}$ is sampled from a standard normal
+distribution. Each action has a synthetic categorical embedding: ten categorical
+attributes with five possible values each. The one-hot expansion of these
+features is the representation used by most clustering methods and reward
+models.
+
+The paper-breakdown notes record two implementation details that matter for
+reproducibility. First, OBP 0.5.5 internally increments
+\texttt{n\_cat\_dim} and \texttt{n\_unobserved\_cat\_dim} by one, so a configured
+10-dimensional observed categorical embedding is represented internally with an
+additional unobserved categorical dimension. Second, action embeddings are
+stochastic: the environment stores a probability matrix $p(e\mid a)$ rather than
+only hard action features, and MIPS marginalizes over this distribution. The
+sampled embeddings are regenerated when \texttt{obtain\_batch\_bandit\_feedback}
+is called, so training and test environments are draws from the same population
+rather than the exact same finite environment.
+
+\subsection{Reward Generation}
+
+The expected reward is constructed as a conjunct effect model:
+\[
+  q(x,a) = g(x,c_a) + h_{c_a}(x,a),
+  \qquad c_a = \phi_{\mathrm{gen}}(a).
+\]
+The reward-generating partition $\phi_{\mathrm{gen}}$ is therefore part of the
+data-generating process.
+
+\paragraph{Cluster effect.}
+The cluster-level term $g(x,c)$ is constant across actions in cluster $c$ for a
+fixed context. It is built from a degree-3 polynomial interaction between the
+context and the cluster identity, plus four nonlinear indicator terms in the
+context. In the plain-language setup note, these are described as broad
+context-cluster preferences.
+
+\paragraph{Residual effect.}
+The within-cluster residual $h_c(x,a)$ captures action-specific variation within
+the cluster:
+\[
+  h_c(x,a)
+  =
+  x^\top M_c \,\mathrm{onehot}(a)
+  + \theta_{x,c}^\top x
+  + \theta_{a,c}^\top \mathrm{onehot}(a).
+\]
+Each cluster receives independent residual parameters using a cluster-indexed
+random seed, recorded in the notes as \texttt{random\_state + c}. This detail is
+central: in the default benchmark, the residual structure is keyed to the
+generating cluster index rather than to a stable feature geometry.
+
+\paragraph{Observed reward.}
+The logged reward is:
+\[
+  r = q(x,a) + \varepsilon,
+  \qquad \varepsilon \sim \mathcal{N}(0,3^2).
+\]
+
+\subsection{Policies}
+
+The logging policy is a softmax over expected rewards:
+\[
+  \pi_0(a\mid x)
+  =
+  \frac{\exp(\beta q(x,a))}
+       {\sum_{a'}\exp(\beta q(x,a'))},
+  \qquad \beta=-0.1.
+\]
+Because $\beta$ is negative, the logging policy is intentionally suboptimal and
+slightly favors worse actions.
+
+The target policy is $\epsilon$-greedy:
+\[
+  \pi(a\mid x)
+  =
+  (1-\epsilon)\mathbf{1}\{a=a^*(x)\}+\frac{\epsilon}{|\mathcal{A}|},
+  \qquad \epsilon=0.2,
+\]
+where $a^*(x)$ is the action with the largest expected reward.
+
+\subsection{OffCEM Estimator}
+
+OffCEM uses a cluster-level importance weight:
+\[
+  w(x,c)
+  =
+  \frac{\pi(c\mid x)}{\pi_0(c\mid x)}
+  =
+  \frac{\sum_{a:\phi(a)=c}\pi(a\mid x)}
+       {\sum_{a:\phi(a)=c}\pi_0(a\mid x)}.
+\]
+The estimator has the same control-variate shape as doubly robust OPE, but with
+cluster weights:
+\[
+  \hat V_{\mathrm{OffCEM}}
+  =
+  \frac{1}{n}\sum_{i=1}^n
+  \left[
+    w(x_i,\phi(a_i))(r_i-\hat f(x_i,a_i))
+    + \hat f(x_i,\pi)
+  \right],
+\]
+where
+\[
+  \hat f(x,\pi)=\sum_a \pi(a\mid x)\hat f(x,a).
+\]
+
+\subsection{Two-Stage Reward Regression}
+
+The two-stage OffCEM reward model decomposes:
+\[
+  \hat f(x,a)=\hat g_\psi(x,\phi(a))+\hat h_\theta(x,a).
+\]
+The first stage fits within-cluster reward differences using action pairs in the
+same cluster:
+\[
+  \min_\theta
+  \sum_{(x,a,b)}
+  \ell_h\left(r_a-r_b,\,
+  \hat h_\theta(x,a)-\hat h_\theta(x,b)\right).
+\]
+This directly targets within-cluster contrast accuracy. The second stage freezes
+$\hat h_\theta$ and fits a cluster-level offset:
+\[
+  \min_\psi
+  \sum_{(x,a,r)}
+  \ell_g\left(r-\hat h_\theta(x,a),\,
+  \hat g_\psi(x,\phi(a))\right).
+\]
+The second stage cannot change within-cluster contrasts because the cluster
+offset cancels for any two actions in the same cluster.
+
+\subsection{Reward-Model Implementation Details}
+
+The paper-breakdown note records the following concrete model choices from the
+code.
+
+\paragraph{Pairwise model.}
+The first-stage pairwise model is a PyTorch \texttt{PairWiseRegression} network.
+It maps a 10-dimensional context vector to a 1000-dimensional vector of
+per-action predictions. The synthetic architecture is four ELU layers with
+dimensions:
+\[
+  10 \rightarrow 30 \rightarrow 30 \rightarrow 30 \rightarrow 1000.
+\]
+Actions are represented by output index rather than by feeding action features
+into the network. Training uses within-cluster action pairs sharing the same user,
+AdamW with learning rate 0.01 and weight decay $10^{-4}$, batch size 128, 30
+epochs, and an exponential learning-rate scheduler with factor 0.95.
+
+\paragraph{Cluster-offset model.}
+The second-stage cluster offset uses OBP's \texttt{RegressionModel} wrapping an
+sklearn \texttt{MLPRegressor} with hidden layers $(50,50,50)$. Its input is the
+concatenation of context and one-hot cluster identity, and its target is
+$r-\hat h_\theta(x,a)$.
+
+\paragraph{Baseline reward model.}
+The direct-method and doubly-robust reward model uses the same
+\texttt{MLPRegressor(50,50,50)} pattern with action context as one-hot action
+features. The code uses \texttt{n\_folds=1}, so there is no cross-fitting in the
+implementation despite cross-fitting being discussed in the paper.
+
+\paragraph{Result accounting.}
+The code stores per-seed estimates, then computes bias, variance, MSE, and
+normalized versions downstream. Older paper-reproduction code stores columns
+named ``bias'' and ``variance'' as per-seed components that are only meaningful
+after aggregation.
+
+\subsection{Local Correctness}
+
+OffCEM is unbiased under common cluster support and local correctness. Local
+correctness requires the reward model to preserve true within-cluster reward
+differences:
+\[
+  q(x,a)-q(x,b)=\hat f(x,a)-\hat f(x,b)
+  \quad\text{for all }a,b\text{ with }\phi(a)=\phi(b).
+\]
+Equivalently, the regression error $q(x,a)-\hat f(x,a)$ may be wrong in absolute
+level, but it must be constant within each cluster.
+
+The local-correctness experiments use a demeaned error metric. For model error
+$e(x,a)=\hat f(x,a)-q(x,a)$,
+\[
+  \bar e_\phi(x,c)=\frac{1}{|A_c|}\sum_{a'\in A_c} e(x,a'),
+  \qquad
+  e_{\mathrm{dm}}(x,a)=e(x,a)-\bar e_\phi(x,\phi(a)),
+\]
+and
+\[
+  \dm(\hat f;\phi)
+  =
+  \mathbb{E}_x\left[
+  \frac{1}{|\mathcal{A}|}\sum_a e_{\mathrm{dm}}(x,a)^2
+  \right].
+\]
+The ratio $\dm_{2s}/\dm_{1s}$ compares two-stage OffCEM against a one-stage
+reward model. Values below one mean two-stage training improves within-cluster
+relative reward prediction.
+
+\subsection{Clustering Methods}
+
+The workspace implements and evaluates several hard partitions. Unless stated
+otherwise, each method receives the one-hot action-feature matrix, the requested
+cluster count $K$, and the experiment seed. After the base assignment, the shared
+\texttt{compute\_clusters} entrypoint dense-relabels cluster IDs into consecutive
+values. In the clustering experiment, base assignments can also be post-processed
+with a balance mode: \texttt{natural} leaves method output unchanged;
+\texttt{balanced} assigns target sizes as evenly as possible; and
+\texttt{power\_law} uses Zipf weights with exponent $\alpha=1.0$. Balance
+post-processing sorts actions by the original cluster labels and then slices that
+stable ordering into the requested target sizes.
+
+\begin{itemize}
+  \item \texttt{original}: the paper/code method, implemented as a random linear
+  score over action features, softmax with temperature, and stochastic sampling.
+  The default temperature is 10. The notes emphasize that this is weakly
+  feature-dependent but not geometrically coherent.
+
+  \item \texttt{kmeans}: sklearn \texttt{KMeans} on the one-hot action-feature
+  matrix, called as \texttt{KMeans(n\_clusters=K, random\_state=seed,
+  n\_init=10)} under scikit-learn 1.0.2. No kernel is used. The objective is
+  ordinary Euclidean squared distance to cluster centroids. Other sklearn
+  defaults apply: \texttt{init="k-means++"}, \texttt{max\_iter=300},
+  \texttt{tol=1e-4}, \texttt{copy\_x=True}, and \texttt{algorithm="auto"}.
+
+  \item \texttt{spectral}: sklearn \texttt{SpectralClustering} with
+  \texttt{affinity="nearest\_neighbors"}, \texttt{n\_neighbors=min(20,
+  n\_actions-1)}, \texttt{assign\_labels="kmeans"}, and the experiment
+  \texttt{random\_state}. This constructs a nearest-neighbor graph from the
+  action-feature matrix, embeds via the graph Laplacian, and labels the spectral
+  embedding with K-means. Other sklearn defaults apply, including
+  \texttt{eigen\_solver=None}, \texttt{n\_components=None},
+  \texttt{n\_init=10}, \texttt{eigen\_tol=0.0}, and \texttt{n\_jobs=None}.
+
+  \item \texttt{agglomerative}: sklearn \texttt{AgglomerativeClustering} with
+  \texttt{n\_clusters=K} and \texttt{linkage="ward"}. Ward linkage uses a
+  Euclidean variance-minimization criterion. No kernel is supplied. Other
+  sklearn defaults apply: \texttt{affinity="euclidean"},
+  \texttt{connectivity=None}, \texttt{compute\_full\_tree="auto"},
+  \texttt{distance\_threshold=None}, and \texttt{compute\_distances=False}.
+
+  \item \texttt{random}: independent random cluster labels sampled with
+  \texttt{check\_random\_state(seed).randint(0,K,size=n\_actions)}. Cluster sizes
+  are therefore multinomial and may be imbalanced before any optional balance
+  post-processing.
+
+  \item \texttt{shuffled\_partition}: random equal-size partition. The method
+  permutes action indices with \texttt{check\_random\_state(seed).permutation},
+  then slices the permutation into $K$ contiguous groups. Each group has size
+  $\lfloor n_{\mathrm{actions}}/K\rfloor$ or one extra action for the first
+  remainder groups. This is the size-balanced random control.
+
+  \item \texttt{feature\_bucket}: deterministic feature-only clustering by
+  mean-centering the action-feature matrix, computing an SVD, projecting actions
+  onto the first right singular vector, ranking projected values with ordinal
+  ranks, and splitting the ranking into $K$ equal-frequency bins via
+  $\lfloor \mathrm{rank}(a)K/n_{\mathrm{actions}}\rfloor$. The \texttt{random\_state}
+  argument is accepted only for API compatibility; the assignment is deterministic
+  given the action features.
+
+  \item \texttt{corrupt\_p}: a controlled corruption of the matched partition by
+  selecting $\mathrm{round}(p\,n_{\mathrm{actions}})$ actions without replacement
+  and reassigning each selected action to an independent uniform label in
+  $\{0,\ldots,K-1\}$. A selected action can receive its original label, so the
+  expected changed fraction is $p(1-1/K)$. The output is dense-relabelled after
+  corruption.
+\end{itemize}
+
+For imprecise-clustering pilots, hard-label adapters and diagnostics also exist
+for fuzzy C-means (FCM), possibilistic C-means (PCM), and rough K-means. ECM is
+documented as optional until \texttt{evclust} is installed and pinned.
+
+\subsection{Estimators and Metrics}
+
+The standard estimator set across the experiments includes \IPS{}, \DM{}, \DR{},
+\MIPS{}, OffCEM one-stage, and OffCEM two-stage. Some newer harnesses also
+include cluster-IPS and \SNIPS{}.
+
+For estimator accuracy, the common normalized metrics are:
+\[
+  \relMSE = \frac{\mathrm{Bias}^2+\mathrm{Var}}{V(\pi)^2},
+  \qquad
+  \relBias = \frac{\mathrm{Bias}^2}{V(\pi)^2},
+  \qquad
+  \relVar = \frac{\mathrm{Var}}{V(\pi)^2}.
+\]
+The local-correctness experiments additionally report $\dm_{2s}$, $\dm_{1s}$,
+and $\dm_{2s}/\dm_{1s}$.
+
+\section{Completed Experiments With Results}
+
+\subsection{Clustering Experiment: Matched and Mismatched Modes}
+
+\paragraph{Purpose.}
+This experiment studied how clustering method, cluster count, and cluster balance
+affect OffCEM OPE performance.
+
+\paragraph{Result paths.}
+\begin{itemize}
+  \item \texttt{/Users/cispa/Documents/OffCEM/clustering\_results/matched/}
+  \item \texttt{/Users/cispa/Documents/OffCEM/clustering\_results/mismatched/}
+  \item \texttt{/Users/cispa/Documents/OffCEM/clustering\_results/clustering\_experiment\_findings.md}
+\end{itemize}
+
+\paragraph{Design.}
+Matched mode used the same clustering method for reward generation and
+estimation. Completed matched results cover \texttt{original}, \texttt{kmeans},
+\texttt{spectral}, and \texttt{random}; cluster counts 10, 50, and 200; natural
+and balanced cluster balance; 15 seeds. Agglomerative was excluded from the main
+matched grid because it was too slow, with only partial output.
+
+Mismatched mode generated data with \texttt{original}/natural clustering and
+estimated with alternative clusterings. It used cluster counts 10, 50, and 200
+with 60 seeds. The notes report all five estimation methods at $n_c=200$, with
+some methods absent at lower cluster counts due to the run structure.
+
+\paragraph{Representative baseline comparison.}
+In the reference setting \texttt{original}, $n_c=50$, natural balance:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Estimator & Mean & Bias & \relMSE & \relVar \\
+\midrule
+\IPS{} & 3.84 & -0.27 & 1.500 & 1.495 \\
+\MIPS{} & 3.79 & -0.32 & 1.480 & 1.473 \\
+\DR{} & -0.81 & -4.92 & 1.483 & 0.048 \\
+\DM{} & -1.20 & -5.31 & 1.672 & 0.003 \\
+OffCEM 1-stage & -1.02 & -5.13 & 1.564 & 0.005 \\
+OffCEM 2-stage & 0.92 & -3.19 & 0.605 & 0.001 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+Cluster count was the dominant factor in matched mode: OffCEM 2-stage relMSE
+roughly doubled from $n_c=10$ to $n_c=200$. No learned method consistently beat
+the original clustering in the matched results; differences among matched
+methods were much smaller than the cluster-count effect. Random clustering
+degraded at higher cluster counts. Bias, not variance, dominated OffCEM error.
+
+In mismatched mode, non-original estimation clusterings performed much worse
+than the original estimation clustering. At $n_c=10$, OffCEM with \texttt{kmeans}
+had relMSE 1.692 versus 0.466 for \texttt{original}. At $n_c=200$, all
+non-original methods were clustered around relMSE 1.53--1.60, while
+\texttt{original} was 1.019.
+
+\paragraph{Caveat.}
+The local-correctness write-up later found two bugs affecting the older
+clustering-experiment code: non-reproducible original clustering and computing
+$V_{\mathrm{true}}$ at the wrong cluster count. Therefore these results are
+listed as completed runs, but their magnitudes should be regenerated before
+being treated as final.
+
+\subsection{Local Correctness: Cluster-Count Sweep}
+
+\paragraph{Purpose.}
+This experiment directly tested whether the OffCEM two-stage reward model
+preserves within-cluster relative reward differences.
+
+\paragraph{Result paths.}
+\texttt{/Users/cispa/Documents/OffCEM/local\_correctness\_results/\{matched,original,random,shuffled\_partition\}/nc\{10,50,100,200\}.json}
+and the associated PNG diagnostics.
+
+\paragraph{Design.}
+The sweep used $n_c\in\{10,50,100,200\}$ and methods
+\texttt{matched}, \texttt{original}, \texttt{random}, and
+\texttt{shuffled\_partition}. The default setup used 3000 logged rounds, 1000
+actions, reward noise 3, target $\epsilon=0.2$, and 10 seeds.
+
+\paragraph{Result.}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Method & $n_c=10$ & $n_c=50$ & $n_c=100$ & $n_c=200$ \\
+\midrule
+\texttt{matched} & 0.61 & 0.41 & 0.20 & 0.14 \\
+\texttt{original} & 0.93 & 0.72 & 0.46 & 0.39 \\
+\texttt{random} & 0.97 & 0.75 & 0.46 & 0.38 \\
+\texttt{shuffled\_partition} & 0.94 & 0.68 & 0.46 & 0.36 \\
+\bottomrule
+\end{tabular}
+\caption{Local-correctness ratio $\dm_{2s}/\dm_{1s}$. Lower is better.}
+\end{table}
+
+\paragraph{Findings.}
+The exact matched partition had the strongest local-correctness benefit at every
+cluster count. Mismatched partitions retained a weaker two-stage benefit, but the
+large matched advantage disappeared. More clusters reduced within-cluster
+heterogeneity and lowered the demeaned error, even though separate relMSE
+experiments showed that more clusters can worsen OPE bias/variance. Size
+imbalance mainly affected tail risk: larger clusters had higher per-cluster
+demeaned error, making random partitions worse in their worst clusters.
+
+\subsection{Local Correctness: Temperature Sweep}
+
+\paragraph{Purpose.}
+This tested whether lowering the original clustering temperature makes the
+generating partition more feature-coherent and therefore recoverable by
+\texttt{kmeans}.
+
+\paragraph{Result paths.}
+\texttt{/Users/cispa/Documents/OffCEM/local\_correctness\_results/temp\_<T>/<method>/nc50.json}
+for $T\in\{1,2,5,10\}$.
+
+\paragraph{Design.}
+Cluster count was fixed at 50. Methods were \texttt{matched}, \texttt{kmeans},
+\texttt{original}, and \texttt{random}.
+
+\paragraph{Result.}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Method & $T=1$ & $T=2$ & $T=5$ & $T=10$ \\
+\midrule
+\texttt{matched} & 0.46 & 0.41 & 0.46 & 0.44 \\
+\texttt{kmeans} & 0.84 & 0.83 & 0.78 & 0.79 \\
+\texttt{original} & 0.71 & 0.70 & 0.71 & 0.74 \\
+\texttt{random} & 0.74 & 0.73 & 0.70 & 0.76 \\
+\bottomrule
+\end{tabular}
+\caption{Local-correctness ratio by original-clustering temperature.}
+\end{table}
+
+\paragraph{Findings.}
+The hypothesis was refuted. Results were nearly flat across temperature.
+\texttt{kmeans} was worse than \texttt{random} at every temperature. Adjusted
+Rand index between the generating partition and K-means remained near zero even
+at very low temperatures. Temperature changes cluster-size balance, not
+feature-geometric coherence.
+
+\subsection{Local Correctness: Corruption Sweep}
+
+\paragraph{Purpose.}
+This experiment created a continuous path from the exact matched partition to a
+nearly random partition by corrupting a fraction $p$ of action labels.
+
+\paragraph{Result paths.}
+\texttt{/Users/cispa/Documents/OffCEM/local\_correctness\_results/corrupt\_p\_<p>/corrupt/nc50.json}.
+
+\paragraph{Design.}
+Cluster count was fixed at 50. The corruption levels were
+$p\in\{0,0.1,0.25,0.5,0.75,1\}$ with 10 seeds. A selected action can be assigned
+its original label, so the expected changed fraction is $p(1-1/K)$.
+
+\paragraph{Result.}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+$p$ & $\dm_{2s}/\dm_{1s}$ & Approx. within-cluster error reduction \\
+\midrule
+0.00 & 0.437 & 56\% \\
+0.10 & 0.491 & 51\% \\
+0.25 & 0.580 & 42\% \\
+0.50 & 0.633 & 37\% \\
+0.75 & 0.684 & 32\% \\
+1.00 & 0.713 & 29\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+Local-correctness violation degraded smoothly and monotonically; there was no
+binary cliff. The two-stage OffCEM point estimate also degraded monotonically as
+the matched partition was corrupted. Standard baselines were flat across $p$
+because they do not use the clustering.
+
+\subsection{Feature-Coherent Local Correctness Benchmark}
+
+\paragraph{Purpose.}
+This benchmark tested whether the fragility observed on the default
+feature-arbitrary reward is intrinsic to OffCEM or an artifact of the synthetic
+reward being keyed to a non-geometric partition.
+
+\paragraph{Result paths.}
+\begin{itemize}
+  \item \texttt{/Users/cispa/Documents/OffCEM/local\_correctness\_results/feature\_coherent\_fb/}
+  \item \texttt{/Users/cispa/Documents/OffCEM/local\_correctness\_results/feature\_coherent\_km/}
+\end{itemize}
+
+\paragraph{Design.}
+The reward-generating clustering was changed using
+\texttt{--gen-clustering-method}. The primary run generated rewards using the
+deterministic \texttt{feature\_bucket} partition and estimated with
+\texttt{matched}, \texttt{feature\_bucket}, \texttt{kmeans}, and \texttt{random}.
+A contrast run generated rewards using \texttt{kmeans}. Both used $n_c=50$ and
+10 seeds.
+
+\paragraph{Primary result.}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Estimation method & $\dm_{2s}$ & $\dm_{1s}$ & Ratio \\
+\midrule
+\texttt{matched} & 7.21 & 18.06 & 0.40 \\
+\texttt{feature\_bucket} & 7.00 & 17.96 & 0.39 \\
+\texttt{kmeans} & 17.51 & 20.74 & 0.85 \\
+\texttt{random} & 16.95 & 22.77 & 0.74 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+When the reward genuinely follows an observable feature geometry,
+\texttt{feature\_bucket} recovers oracle-level local correctness without access to
+the generating labels. K-means still fails because it captures a different
+feature geometry from the one that generated the reward. The refined conclusion
+is that local correctness depends on alignment between the estimation partition
+and the reward residual geometry; that alignment can be achieved without oracle
+labels, but feature use alone is insufficient.
+
+\subsection{Join Experiment: Does Local-Correctness Violation Predict OPE Error?}
+
+\paragraph{Purpose.}
+This experiment paired local-correctness violation and OffCEM estimator error on
+identical runs. It tested whether $\dm$ is a useful within-problem diagnostic for
+choosing a clustering.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/join\_results/cell\_*.json}.
+
+\paragraph{Design.}
+The grid contained:
+\[
+  n_c\in\{10,50,200\},\quad
+  \epsilon\in\{0,0.2,0.7\},\quad
+  \sigma\in\{1,3\},\quad
+  n\in\{1000,3000\}.
+\]
+For each of the 36 cells, the experiment evaluated six clustering conditions:
+\texttt{matched}, \texttt{kmeans}, \texttt{random},
+\texttt{shuffled\_partition}, \texttt{corrupt\_p0.25}, and
+\texttt{corrupt\_p0.75}, with 10 seeds.
+
+\paragraph{Findings.}
+Within a fixed problem cell, $\dm$ strongly predicted OffCEM error:
+\begin{itemize}
+  \item mean Spearman correlation of $\dm$ with $\relBias$ was +0.80;
+  \item median Spearman correlation was 0.83;
+  \item correlation was positive in 36/36 cells;
+  \item $\arg\min(\dm)$ matched $\arg\min(\relBias)$ in 36/36 cells.
+\end{itemize}
+Across different problem cells, raw $\dm$ did not port because it is in
+reward-units squared while normalized estimator error also depends on policy,
+cluster count, reward scale, and true value.
+
+\paragraph{Baseline crossover.}
+The same grid showed that clustering quality decides whether OffCEM is worth
+using relative to a baseline such as DR:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+OffCEM 2-stage clustering & Pooled relMSE & Cells beating DR \\
+\midrule
+\texttt{matched} & 1.32 & 36/36 \\
+\texttt{corrupt\_p0.25} & 1.78 & 36/36 \\
+\texttt{corrupt\_p0.75} & 2.41 & 16/36 \\
+\texttt{random}/\texttt{kmeans}/\texttt{shuffled} & 2.50--2.56 & 6--14/36 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Join Experiment on Feature-Coherent Rewards}
+
+\paragraph{Purpose.}
+This repeated the join grid with the reward generated by the deterministic
+\texttt{feature\_bucket} partition. It tested whether oracle-free feature-aligned
+clustering reaches oracle estimator error at full grid scale.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/join\_results\_fc/cell\_*.json}.
+
+\paragraph{Design.}
+The grid was the same 36-cell design as the original join. The six clustering
+conditions were \texttt{matched}, \texttt{feature\_bucket}, \texttt{kmeans},
+\texttt{random}, \texttt{corrupt\_p0.25}, and \texttt{corrupt\_p0.75}.
+
+\paragraph{Findings.}
+Within-cell diagnostic performance remained strong: mean Spearman correlation of
+$\dm$ with $\relBias$ was +0.85, positive in 36/36 cells. The strict argmin match
+dropped because \texttt{matched} and \texttt{feature\_bucket} were genuine
+co-winners, not because the diagnostic failed.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+OffCEM 2-stage clustering & Pooled relMSE & Cells beating DR \\
+\midrule
+\texttt{matched} & 1.34 & 36/36 \\
+\texttt{feature\_bucket} & 1.34 & 36/36 \\
+\texttt{corrupt\_p0.25} & 1.80 & 36/36 \\
+\texttt{corrupt\_p0.75} & 2.46 & 7/36 \\
+\texttt{kmeans} & 2.49 & 8/36 \\
+\texttt{random} & 2.57 & 0/36 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The feature-bucket clustering tied the oracle matched partition without using
+oracle labels. This is the strongest positive result recorded in the notes.
+
+\subsection{Applicability Benchmark Phase A Smoke}
+
+\paragraph{Purpose.}
+The applicability package asks when OffCEM wins or loses against baselines across
+a broader synthetic design. It separates reward variance into four components:
+\[
+  q(x,a)=
+  \sqrt{\alpha_g}g(x,\mathrm{cluster}(a))
+  +\sqrt{\alpha_f}h_{\mathrm{feature}}(x,a)
+  +\sqrt{\alpha_i}h_{\mathrm{identity}}(x,a)
+  +\sqrt{\alpha_u}h_{\mathrm{hidden}}(x,a).
+\]
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/applicability\_results/smoke/}.
+
+\paragraph{Design.}
+Phase A smoke used 2 Sobol cells, 5 seeds, and 6 partitions. The dataset was
+generated once per cell/seed and reused across partitions and estimators. The
+estimator harness included OffCEM 2-stage, OffCEM 1-stage, cluster-IPS, MIPS,
+DR, DM, IPS, and SNIPS. Diagnostics included DM variants, effective sample size,
+importance-weight tails, unsupported target mass, partition ARI, cluster-size
+statistics, observed actions and pairs per cluster, and realized reward variance
+shares.
+
+\paragraph{Findings and caveat.}
+The smoke run completed end-to-end and wrote checkpoints,
+\texttt{estimator\_metrics.csv}, and \texttt{paired\_comparisons.csv}. The
+handoff notes report that OffCEM 2-stage underperformed baselines in this tiny
+configuration, even on the matched partition. This is treated as a likely
+degenerate-smoke artifact rather than a final research conclusion.
+
+\subsection{Membership-Uncertainty Direction 1: Hardened Clustering Diagnostics}
+
+\paragraph{Purpose.}
+This pilot asked whether uncertainty-aware clustering methods improve OffCEM or
+diagnose OffCEM failure when hardened to ordinary cluster labels.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/direction1/}.
+
+\paragraph{Design.}
+The completed pilot used two generating setups
+(\texttt{original}, \texttt{feature\_bucket}), 5 seeds, 1000 actions, 50
+clusters, 3000 rounds, and methods \texttt{matched}, \texttt{original},
+\texttt{feature\_bucket}, \texttt{kmeans}, \texttt{random}, FCM, PCM, and rough
+K-means.
+
+\paragraph{Findings.}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+Generating setup & matched & kmeans & rough & fcm & pcm & random \\
+\midrule
+\texttt{feature\_bucket} & 0.581 & 0.942 & 0.947 & 1.046 & 1.300 & 1.336 \\
+\texttt{original} & 0.770 & 0.951 & 1.114 & 1.172 & 1.355 & 1.133 \\
+\bottomrule
+\end{tabular}
+\caption{OffCEM relMSE from the membership-uncertainty diagnostics pilot.}
+\end{table}
+
+The matched partition was the best OffCEM variant in both setups, but standard
+baselines were better in the original generating setup. FCM produced nearly
+uniform memberships, PCM collapsed all centers, and rough K-means marked about
+75\% of actions as boundary objects. Policy-weighted DM ranked OffCEM error
+better than raw DM.
+
+\subsection{Membership-Uncertainty Direction 6: Partition Sensitivity}
+
+\paragraph{Purpose.}
+This experiment sampled plausible hard partitions from FCM, PCM, and rough
+K-means uncertainty outputs to measure sensitivity of OffCEM estimates to the
+partition draw.
+
+\paragraph{Result paths.}
+\begin{itemize}
+  \item \texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/direction6/}
+  \item \texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/direction6\_upd/}
+\end{itemize}
+
+\paragraph{Design.}
+The corrected run fixed the reward-model random seed across partition draws, so
+within-seed variation reflected the sampled partition rather than model
+initialization. It used the same two generating setups as Direction 1 and 20
+sampled partitions for FCM, PCM, and rough K-means.
+
+\paragraph{Findings.}
+Mean sampled estimate ranges were large, about 1.75--2.04 across methods and
+generating setups. None of the sampled min--max or 5th--95th percentile ranges
+covered the true value in any seed. Sampling generally worsened FCM and rough
+K-means relMSE. PCM sampling improved over its degenerate hardened partition in
+many draws, but remained noncompetitive. Sensitivity width alone did not reliably
+predict OffCEM failure.
+
+\subsection{Controlled FCM Overlap}
+
+\paragraph{Purpose.}
+This controlled experiment tested whether FCM membership uncertainty adds
+information beyond policy-weighted DM when true action overlap is known.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/controlled\_fcm\_overlap/}.
+
+\paragraph{Design.}
+The generator created known two-cluster memberships and varied the fraction of
+ambiguous actions. It used two reward modes:
+\texttt{reward\_relevant}, where rewards mix latent cluster reward functions
+using the known memberships, and \texttt{feature\_only}, where feature overlap is
+present but rewards use only the primary hard cluster. The completed run covered
+2 reward modes, 4 ambiguity levels, 10 seeds, and 1760 partition evaluations.
+
+\paragraph{Findings.}
+FCM did not recover the known memberships: ambiguity AUC was approximately
+chance, estimated entropy was high even at zero true ambiguity, and membership
+entropy had near-zero or negative correlation with the reward-mixture effect.
+FCM-hard OffCEM error was nearly identical between reward-relevant and
+feature-only modes, indicating that degradation came mainly from worsening FCM
+partitions as features overlapped, not from successful detection of
+reward-relevant ambiguity. Adding FCM uncertainty improved held-ambiguity error
+calibration modestly but not ranking.
+
+\subsection{Relaxed Local Correctness With Rough K-Means}
+
+\paragraph{Purpose.}
+This experiment evaluated an epsilon-relaxed local-correctness bias bound for
+the population OffCEM functional while varying rough-partition ambiguity.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/relaxed\_local\_correctness/}.
+
+\paragraph{Design.}
+The run varied ambiguity fractions
+$\{0,0.25,0.5,0.75\}$ and rough ratios
+$\{1.05,1.15,1.25,1.5\}$ with 5 seeds. It evaluated the hardened rough
+partition, sampled rough partitions, and the oracle primary partition. It
+computed the fitted finite-sample OffCEM estimate, population OffCEM functional,
+exact context-cluster residual oscillation epsilon, TV-weighted theoretical bias
+bound, and coverage.
+
+\paragraph{Findings.}
+The exact epsilon-TV bound covered 100\% of all 560 partition evaluations. The
+finite-sample estimate coverage was also 100\% in the grid. The bound was
+conservative: about 2.1 times the actual absolute population bias, with interval
+widths around 13--14 while the mean true policy value was 5.47. Rough K-means
+detected increasing ambiguity, but sampled rough partitions added little to the
+robust interval width. The result validates the bound mathematically in the
+controlled setup, but does not yet provide a sharp practical interval.
+
+\subsection{Domain-Informed and Outcome-Aware Clustering}
+
+\paragraph{Purpose.}
+This experiment tested whether OffCEM clusters should come from generic metadata,
+external domain knowledge, auxiliary-data outcome profiles, or hybrid
+representations.
+
+\paragraph{Result path.}
+\texttt{/Users/cispa/Documents/OffCEM/imprecise\_results/domain\_outcome\_clustering/}.
+
+\paragraph{Design.}
+The synthetic environment separated generic metadata, true domain classes,
+observed noisy domain attributes, and latent outcome classes. Domain alignment
+took values $\{0,0.5,1\}$ and domain-label noise took values
+$\{0,0.25,0.5\}$, with 10 seeds per cell. Methods included feature-only K-means,
+domain-informed K-means, oracle outcome-profile K-means, estimated
+outcome-profile K-means from an independent auxiliary log, a hybrid
+representation, shuffled-domain, and random controls.
+
+\paragraph{Findings.}
+Observable domain knowledge worked when it was reward-relevant. With clean
+domain labels, domain-informed relMSE moved from 1.384 at zero domain alignment
+to 0.454 at half alignment and 0.003 at full alignment. The benefit degraded
+with label noise. Oracle outcome-profile clustering was the best clustering
+overall and selected the lowest-error partition in 84/90 cells. Policy-weighted
+DM selected the same argmin in 84/90 cells and had mean within-cell Spearman
+correlation 0.77 with OffCEM squared error.
+
+The estimated-outcome arm was inconclusive: it did not recover outcome structure
+because the auxiliary reward model used generic action features that were
+independent of domain and outcome labels. Thus the experiment validates clean
+domain knowledge and oracle outcome geometry, but not the current estimated
+outcome-profile implementation.
+
+\section{Cross-Experiment Conclusions}
+
+\begin{enumerate}
+  \item Alignment between the estimation partition and reward residual geometry
+  is the central condition for OffCEM success.
+  \item The default synthetic benchmark is feature-arbitrary: the original
+  generating partition is a stochastic softmax sample with near-zero alignment
+  to K-means, and residual functions are keyed to cluster index.
+  \item Local correctness degrades continuously under partition corruption;
+  it is not an empirical all-or-nothing gate.
+  \item The demeaned local-correctness metric predicts OffCEM error well within a
+  fixed problem, but raw DM does not define a portable threshold across problem
+  settings.
+  \item Oracle-free recovery is possible when the clustering geometry is
+  observable and reward-relevant. The feature-bucket benchmark and clean
+  domain-informed experiment are the main positive examples.
+  \item Current fuzzy/possibilistic/rough membership-uncertainty pilots do not
+  improve OffCEM on the tested one-hot representations. Their strongest value so
+  far is diagnostic, especially through policy-weighted DM.
+  \item Epsilon-relaxed local correctness gives valid controlled bias bounds, but
+  the current bounds are too wide to be practically sharp.
+\end{enumerate}
+
+\section{Completed-Result Inventory}
+
+\begin{longtable}{p{0.28\linewidth}p{0.37\linewidth}p{0.27\linewidth}}
+\toprule
+Experiment & Completed result location & Status note \\
+\midrule
+\endhead
+Clustering matched/mismatched &
+\texttt{clustering\_results/} &
+Completed, but older magnitudes should be regenerated due to later B1/B2 fixes. \\
+Local correctness cluster-count sweep &
+\texttt{local\_correctness\_results/\{matched,original,random,shuffled\_partition\}/} &
+Authoritative local-correctness result source. \\
+Local correctness temperature sweep &
+\texttt{local\_correctness\_results/temp\_*} &
+Completed for matched, kmeans, original, random. \\
+Local correctness corruption sweep &
+\texttt{local\_correctness\_results/corrupt\_p\_*} &
+Completed continuum from matched to random. \\
+Feature-coherent local correctness &
+\texttt{local\_correctness\_results/feature\_coherent\_fb/} and
+\texttt{feature\_coherent\_km/} &
+Completed; confirms oracle-free recovery for feature-bucket geometry. \\
+Join experiment, original generation &
+\texttt{join\_results/cell\_*.json} &
+Completed 36-cell grid. \\
+Join experiment, feature-bucket generation &
+\texttt{join\_results\_fc/cell\_*.json} &
+Completed 36-cell grid. \\
+Applicability Phase A smoke &
+\texttt{applicability\_results/smoke/} &
+Completed smoke only; not a final research conclusion. \\
+Imprecise Direction 1 &
+\texttt{imprecise\_results/direction1/} &
+Completed pilot. \\
+Imprecise Direction 6 corrected &
+\texttt{imprecise\_results/direction6\_upd/} &
+Completed corrected sensitivity pilot. \\
+Controlled FCM overlap &
+\texttt{imprecise\_results/controlled\_fcm\_overlap/} &
+Completed. \\
+Relaxed local correctness &
+\texttt{imprecise\_results/relaxed\_local\_correctness/} &
+Completed. \\
+Domain/outcome clustering &
+\texttt{imprecise\_results/domain\_outcome\_clustering/} &
+Completed. \\
+\bottomrule
+\end{longtable}
+
+\end{document}
