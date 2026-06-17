@@ -84,6 +84,16 @@ def parse_args():
         action="store_true",
         help="Quick test: 5 seeds, 2 n_clusters values",
     )
+    p.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip summary plot generation. Useful for parallel/array workers.",
+    )
+    p.add_argument(
+        "--plot-only",
+        action="store_true",
+        help="Only regenerate summary plots from existing checkpoints.",
+    )
     return p.parse_args()
 
 
@@ -485,6 +495,10 @@ def plot_all(out_dir):
 def main():
     args = parse_args()
 
+    if args.plot_only:
+        plot_all(args.out_dir)
+        return
+
     if args.quick:
         args.n_seeds = 5
         args.n_clusters = "10,50"
@@ -498,7 +512,8 @@ def main():
         run_mismatched(args)
 
     print(f"\nTotal time: {(time()-start_time)/60:.1f} min")
-    plot_all(args.out_dir)
+    if not args.no_plot:
+        plot_all(args.out_dir)
 
 
 if __name__ == "__main__":
