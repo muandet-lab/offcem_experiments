@@ -1,0 +1,313 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[strings]{underscore}
+\usepackage[hidelinks]{hyperref}
+
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+
+\newcommand{\OffCEM}{\textsc{OffCEM}}
+\newcommand{\DR}{\textsc{DR}}
+\newcommand{\DM}{\textsc{DM}}
+\newcommand{\IPS}{\textsc{IPS}}
+\newcommand{\MIPS}{\textsc{MIPS}}
+\newcommand{\relMSE}{\mathrm{relMSE}}
+\newcommand{\dm}{\mathrm{dm}}
+
+\title{Does OffCEM Need Oracle Cluster Labels?\\Evidence from Existing Experiments}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Question}
+
+The original \OffCEM{} synthetic benchmark constructs rewards from an action
+partition. The practical question is whether \OffCEM{} works because it has
+access to this reward-defining partition, or whether it can discover a useful
+partition from observed action features.
+
+The existing experiments support the following conclusion:
+
+\begin{quote}
+\OffCEM{} does not require a file of oracle labels as an input in principle, but
+it does require the estimation partition to align closely with the
+reward-relevant partition geometry. In the default benchmark, that geometry is
+hidden and not recoverable by ordinary feature clustering. The feature-bucket
+positive result is therefore best interpreted as a known-rule or oracle-like
+control, not as evidence of practical cluster discovery.
+\end{quote}
+
+\section{Definitions}
+
+Let $\phi_{\mathrm{gen}}$ be the reward-generating partition and
+$\phi_{\mathrm{est}}$ be the partition used by \OffCEM{} during estimation. The
+synthetic reward has the form
+\[
+q(x,a) = g(x,\phi_{\mathrm{gen}}(a)) + h_{\phi_{\mathrm{gen}}(a)}(x,a).
+\]
+Changing $\phi_{\mathrm{est}}$ changes the within-cluster residual target that
+the two-stage reward model must learn. Thus the key issue is not whether a
+method uses features, but whether its partition matches the reward residual
+geometry.
+
+We use the within-cluster demeaned error
+\[
+\dm(f;\phi) =
+\mathbb{E}_x\left[
+  \frac{1}{|\mathcal{A}|}
+  \sum_a
+  \left(
+    f(x,a)-q(x,a)
+    -
+    \frac{1}{|\mathcal{A}_{\phi(a)}|}
+    \sum_{b:\phi(b)=\phi(a)}(f(x,b)-q(x,b))
+  \right)^2
+\right]
+\]
+as the local-correctness diagnostic. This removes cluster-level offsets and
+isolates whether the reward model preserves within-cluster reward contrasts.
+
+\section{Evidence from the Default Benchmark}
+
+In the default benchmark, rewards are generated using the paper's stochastic
+``original'' partition. That partition is only weakly feature-dependent and has
+near-zero agreement with standard feature clusterings. The local-correctness
+results show that the exact generating partition is much better than any
+mismatched alternative.
+
+\begin{table}[h]
+\centering
+\caption{Local-correctness ratios on the default benchmark. Values are
+$\dm_{\mathrm{2s}}/\dm_{\mathrm{1s}}$; smaller is better. Source:
+\texttt{local_correctness_results/local_correctness_findings.md}.}
+\begin{tabular}{lrrrr}
+\toprule
+Estimation partition & $K=10$ & $K=50$ & $K=100$ & $K=200$ \\
+\midrule
+matched & 0.61 & 0.41 & 0.20 & 0.14 \\
+original rerun & 0.93 & 0.72 & 0.46 & 0.39 \\
+random & 0.97 & 0.75 & 0.46 & 0.38 \\
+shuffled partition & 0.94 & 0.68 & 0.46 & 0.36 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $K=50$, the exact matched partition reduces within-cluster error by roughly
+60\%, while rerunning the paper's original stochastic mechanism behaves much
+closer to random. This matters because the original mechanism redraws a new
+partition; it is not the same as reusing the reward-generating labels.
+
+The temperature sweep reinforces this point. Lowering the original mechanism's
+softmax temperature changes cluster-size balance, but it does not make the
+partition recoverable by K-means. The adjusted Rand index between the generating
+partition and K-means remains approximately zero across temperatures, and
+K-means is worse than random in the local-correctness ratio.
+
+\section{Corruption Evidence}
+
+The corruption sweep starts from the exact generating partition and randomly
+reassigns a fraction $p$ of actions. This gives an interpretable alignment knob:
+$p=0$ is the matched partition, and $p=1$ is close to a random partition.
+
+\begin{table}[h]
+\centering
+\caption{Default-benchmark corruption sweep for local correctness at $K=50$.
+Values are $\dm_{\mathrm{2s}}/\dm_{\mathrm{1s}}$. Source:
+\texttt{local_correctness_results/corrupt_p_*/corrupt/nc50.json}.}
+\begin{tabular}{rrrr}
+\toprule
+Corruption $p$ & $\dm_{\mathrm{2s}}$ & $\dm_{\mathrm{1s}}$ & ratio \\
+\midrule
+0.00 & 8.01 & 18.39 & 0.44 \\
+0.10 & 9.50 & 19.39 & 0.49 \\
+0.25 & 11.98 & 20.67 & 0.58 \\
+0.50 & 14.09 & 22.26 & 0.63 \\
+0.75 & 15.90 & 23.24 & 0.68 \\
+1.00 & 16.76 & 23.54 & 0.71 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This shows a smooth degradation rather than a cliff: as the estimation partition
+moves away from the reward-generating partition, the local-correctness benefit
+shrinks continuously. The JSON files for this sweep store estimator point values
+but not the true policy value, so they do not by themselves contain relMSE.
+
+The join experiments nevertheless show that this diagnostic is consequential.
+Across the full 36-cell join grid, $\dm$ ranks \OffCEM{} error within each fixed
+problem: mean Spearman correlation is about $+0.80$ for $\dm$ versus relative
+bias squared, and the lowest-$\dm$ clustering is the lowest-bias clustering in
+36/36 cells.
+
+\section{Baseline Crossover}
+
+The join results connect partition quality to actual OPE error. In the default
+benchmark, well-aligned partitions beat \DR{}, while badly aligned partitions do
+not.
+
+\begin{table}[h]
+\centering
+\caption{Default-generation join results pooled over 36 cells. Source:
+\texttt{join_results/cell_*.json} and the summary in
+\texttt{local_correctness_results/local_correctness_findings.md}.}
+\begin{tabular}{lrr}
+\toprule
+\OffCEM{} estimation partition & Mean \relMSE{} & Cells beating \DR{} \\
+\midrule
+matched & 1.32 & 36/36 \\
+corrupt $p=0.25$ & 1.78 & 36/36 \\
+corrupt $p=0.75$ & 2.41 & 16/36 \\
+random / K-means / shuffled & 2.50--2.56 & 6--14/36 \\
+\DR{} baseline & 2.41 & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Thus poor clustering does not merely worsen an internal diagnostic. It can make
+\OffCEM{} worse than a standard baseline. This supports the practical statement
+that \OffCEM{} is useful only when the clustering is aligned enough.
+
+\section{Feature-Bucket Result: Positive Control, Not Discovery}
+
+The feature-coherent benchmark changes the generator so the reward partition is
+a deterministic feature-bucket rule. This rule projects action features onto the
+first principal component and slices the ordered actions into equal-frequency
+buckets. Estimation with the same feature-bucket rule exactly reconstructs the
+generating partition.
+
+\begin{table}[h]
+\centering
+\caption{Feature-bucket-generated reward, $K=50$. Source:
+\texttt{local_correctness_results/feature_coherent_fb/*/nc50.json}.}
+\begin{tabular}{lrrr}
+\toprule
+Estimation partition & $\dm_{\mathrm{2s}}$ & $\dm_{\mathrm{1s}}$ & ratio \\
+\midrule
+matched oracle & 7.21 & 18.06 & 0.40 \\
+feature bucket & 7.00 & 17.96 & 0.39 \\
+K-means & 17.51 & 20.74 & 0.85 \\
+random & 16.95 & 22.77 & 0.74 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At full join scale, feature bucket also ties the matched oracle on estimator
+error.
+
+\begin{table}[h]
+\centering
+\caption{Feature-bucket-generation join results pooled over 36 cells. Source:
+\texttt{join_results_fc/cell_*.json}.}
+\begin{tabular}{lrr}
+\toprule
+\OffCEM{} estimation partition & Mean \relMSE{} & Cells beating \DR{} \\
+\midrule
+matched oracle & 1.34 & 36/36 \\
+feature bucket & 1.34 & 36/36 \\
+corrupt $p=0.25$ & 1.80 & 36/36 \\
+corrupt $p=0.75$ & 2.46 & 7/36 \\
+K-means & 2.49 & 8/36 \\
+random & 2.57 & 0/36 \\
+\DR{} baseline & 2.36 & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is an important positive control: literal label access is not necessary if
+the correct partition rule is known and reproducible from observed features.
+However, it is not evidence that a practitioner can generally discover the
+right partition. The success comes from using the same deterministic rule during
+generation and estimation. K-means uses the same action features but fails
+because it captures a different feature geometry.
+
+For that reason, the feature-bucket result should be described as a known-rule
+or oracle-like structural control, not as an oracle-free discovery result.
+
+\section{Reverse-Mismatch Evidence}
+
+The existing imprecise-clustering pilot already contains the reverse mismatch
+that would otherwise require a new experiment: generate rewards using
+feature-bucket clusters, then estimate using the paper's original mechanism.
+
+\begin{table}[h]
+\centering
+\caption{Reverse mismatch: feature-bucket generation with alternative estimation
+partitions. Source: \texttt{imprecise_results/direction1/method_summary.csv}.
+This is a 5-seed pilot, so it is supporting evidence rather than the main
+significance-tested result.}
+\begin{tabular}{lrrr}
+\toprule
+Generation & Estimation partition & \relMSE{} & ARI with generator \\
+\midrule
+feature bucket & matched & 0.581 & 1.000 \\
+feature bucket & feature bucket & 0.581 & 1.000 \\
+feature bucket & K-means & 0.942 & 0.016 \\
+feature bucket & original rerun & 1.175 & $\approx 0$ \\
+feature bucket & random & 1.336 & $\approx 0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This directly shows that the paper's original clustering mechanism is not
+intrinsically special. When it is not the reward-generating mechanism, it fails
+like other mismatched partitions.
+
+\section{What the Existing Results Can and Cannot Claim}
+
+\subsection{Supported claims}
+
+\begin{enumerate}
+    \item On the default benchmark, \OffCEM{}'s advantage depends on using the
+    reward-generating partition or a close approximation to it.
+    \item Standard feature clustering does not recover that partition. K-means
+    has near-zero ARI with the default generating partition and performs like a
+    mismatched or random partition.
+    \item Rerunning the paper's original stochastic clustering is not equivalent
+    to oracle access. It redraws a different partition and behaves much closer
+    to random than to matched.
+    \item The feature-bucket benchmark proves that literal label access is not
+    logically required, but only when the correct deterministic feature rule is
+    known and exactly reproducible.
+    \item The paper's original mechanism also fails in reverse mismatch:
+    feature-bucket generation plus original estimation performs poorly relative
+    to matched or feature-bucket estimation.
+\end{enumerate}
+
+\subsection{Claims that are not supported}
+
+\begin{enumerate}
+    \item The results do not show that ordinary unsupervised clustering can
+    discover the reward-relevant partition.
+    \item The feature-bucket result should not be summarized as ``\OffCEM{}
+    works without oracle information'' without qualification. It is better
+    summarized as ``\OffCEM{} works when the correct partition rule is known from
+    observed structure.''
+    \item The current dense corruption sweep does not contain relMSE because the
+    local-correctness JSONs do not save the true policy value. Dense relMSE over
+    $p \in \{0,.1,.25,.5,.75,1\}$ would be a useful final figure, but it is not
+    required for the core oracle-label conclusion.
+\end{enumerate}
+
+\section{Final Conclusion}
+
+The most defensible conclusion is:
+
+\begin{quote}
+\OffCEM{} is not a general clustering-discovery method. Its empirical advantage
+depends on the estimation partition being aligned with the reward-relevant
+partition. In the original benchmark, that partition is effectively oracle
+information because it is hidden in the synthetic reward construction and is
+not recovered by feature clustering. The feature-bucket benchmark shows an
+escape hatch: if the reward-relevant partition is generated by a known,
+deterministic feature rule, then the same rule can match oracle performance
+without reading labels. But this is a known-structure setting, not evidence that
+the correct clusters can be discovered automatically.
+\end{quote}
+
+\end{document}

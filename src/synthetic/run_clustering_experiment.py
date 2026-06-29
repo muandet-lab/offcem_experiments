@@ -371,6 +371,7 @@ def plot_matched_results(out_dir):
         "spectral": "#2ca02c",
         "agglomerative": "#d62728",
         "random": "#9467bd",
+        "shuffled_partition": "#8c564b",
     }
     markers = {
         "original": "o",
@@ -378,12 +379,13 @@ def plot_matched_results(out_dir):
         "spectral": "^",
         "agglomerative": "D",
         "random": "v",
+        "shuffled_partition": "P",
     }
 
     for balance, methods_data in combos.items():
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
         metric_keys = ["relMSE", "relBias2", "relVar"]
-        titles = ["Normalized MSE", "Relative Squared Bias", "Relative Sample Variance"]
+        titles = ["Relative MSE", "Relative Squared Bias", "Relative Sample Variance"]
 
         for ax, mkey, title in zip(axes, metric_keys, titles):
             for method, nc_data in sorted(methods_data.items()):
@@ -398,8 +400,9 @@ def plot_matched_results(out_dir):
                     marker=markers.get(method, "x"),
                     color=colors.get(method, "gray"),
                     label=method,
-                    linewidth=2,
-                    markersize=7,
+                    linewidth=1.1,
+                    markersize=4.5,
+                    alpha=0.9,
                 )
             ax.set_xlabel("number of clusters", fontsize=12)
             ax.set_title(title, fontsize=13, fontweight="bold")
@@ -448,7 +451,7 @@ def plot_mismatched_results(out_dir):
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     metric_keys = ["relMSE", "relBias2", "relVar"]
-    titles = ["Normalized MSE", "Relative Squared Bias", "Relative Sample Variance"]
+    titles = ["Relative MSE", "Relative Squared Bias", "Relative Sample Variance"]
 
     for ax, mkey, title in zip(axes, metric_keys, titles):
         for i, est in enumerate(est_names):
@@ -463,8 +466,9 @@ def plot_mismatched_results(out_dir):
                 marker=markers_list[i % len(markers_list)],
                 color=colors_list[i % len(colors_list)],
                 label=label,
-                linewidth=2,
-                markersize=7,
+                linewidth=1.1,
+                markersize=4.5,
+                alpha=0.9,
             )
         ax.set_xlabel("number of clusters", fontsize=12)
         ax.set_title(title, fontsize=13, fontweight="bold")

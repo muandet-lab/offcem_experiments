@@ -194,42 +194,79 @@ def build_estimation_clusterings(bandit_data, methods, n_clusters, corrupt_p_lis
     return out
 
 
-def run_cell(gen_method, n_clusters, eps, reward_std, n, methods, corrupt_p_list, n_seeds, temperature):
+def _n_estimation_partitions(methods, corrupt_p_list):
+    total = 0
+    for method in methods:
+        if method == "corrupt":
+            total += len(corrupt_p_list)
+        else:
+            total += 1
+    return total
+
+
+def run_cell(
+    gen_method,
+    n_clusters,
+    eps,
+    reward_std,
+    n,
+    methods,
+    corrupt_p_list,
+    n_seeds,
+    temperature,
+    progress_desc=None,
+):
     """One factor cell: returns one row per estimation method, paired (dm, relMSE)."""
     C = DEFAULTS
+    if progress_desc:
+        tqdm.write(f"{progress_desc}: computing V_true")
     v_true = compute_v_true(gen_method, n_clusters, eps, reward_std, temperature)
 
     # per estimation-method accumulators
     per_method = {}  # label -> dict(est_vals=list of dicts, dm_2s=[], dm_1s=[])
 
     dataset = make_dataset(reward_std)
-    for seed_idx in range(n_seeds):
-        seed = C["RANDOM_STATE"] + seed_idx
-        bandit_data = dataset.obtain_batch_bandit_feedback(
-            n_rounds=n,
-            n_users=C["N_VAL_USERS"],
-            n_clusters=n_clusters,
-            clustering_method=gen_method,
-            cluster_balance="natural",
-            cluster_temperature=temperature,
-        )
-        pi_e = gen_eps_greedy(expected_reward=bandit_data["expected_reward"], eps=eps)
-        expected_reward = bandit_data["expected_reward"]
-
-        for label, c1d, c3d in build_estimation_clusterings(
-            bandit_data, methods, n_clusters, corrupt_p_list, C["RANDOM_STATE"]
-        ):
-            f_x_a, q_x_a = train_reward_model_via_two_stage(bandit_data, c3d, random_state=seed)
-            est_vals = run_ope(
-                bandit_data=bandit_data, pi_e=pi_e, action_clusters=c3d,
-                f_x_a=f_x_a, q_x_a=q_x_a,
+    n_partitions = _n_estimation_partitions(methods, corrupt_p_list)
+    progress_total = n_seeds * n_partitions
+    with tqdm(
+        total=progress_total,
+        desc=progress_desc or "cell",
+        unit="fit",
+        leave=False,
+        dynamic_ncols=True,
+    ) as pbar:
+        for seed_idx in range(n_seeds):
+            seed = C["RANDOM_STATE"] + seed_idx
+            pbar.set_postfix(seed=seed_idx, est="data")
+            bandit_data = dataset.obtain_batch_bandit_feedback(
+                n_rounds=n,
+                n_users=C["N_VAL_USERS"],
+                n_clusters=n_clusters,
+                clustering_method=gen_method,
+                cluster_balance="natural",
+                cluster_temperature=temperature,
             )
-            dm2 = demeaned_mse(f_x_a[:, :, 0], expected_reward, c1d)
-            dm1 = demeaned_mse(q_x_a[:, :, 0], expected_reward, c1d)
-            acc = per_method.setdefault(label, dict(est_vals=[], dm_2s=[], dm_1s=[]))
-            acc["est_vals"].append(est_vals)
-            acc["dm_2s"].append(dm2)
-            acc["dm_1s"].append(dm1)
+            pi_e = gen_eps_greedy(expected_reward=bandit_data["expected_reward"], eps=eps)
+            expected_reward = bandit_data["expected_reward"]
+
+            for label, c1d, c3d in build_estimation_clusterings(
+                bandit_data, methods, n_clusters, corrupt_p_list, C["RANDOM_STATE"]
+            ):
+                pbar.set_postfix(seed=seed_idx, est=label)
+                f_x_a, q_x_a = train_reward_model_via_two_stage(
+                    bandit_data, c3d, random_state=seed
+                )
+                est_vals = run_ope(
+                    bandit_data=bandit_data, pi_e=pi_e, action_clusters=c3d,
+                    f_x_a=f_x_a, q_x_a=q_x_a,
+                )
+                dm2 = demeaned_mse(f_x_a[:, :, 0], expected_reward, c1d)
+                dm1 = demeaned_mse(q_x_a[:, :, 0], expected_reward, c1d)
+                acc = per_method.setdefault(label, dict(est_vals=[], dm_2s=[], dm_1s=[]))
+                acc["est_vals"].append(est_vals)
+                acc["dm_2s"].append(dm2)
+                acc["dm_1s"].append(dm1)
+                pbar.update(1)
 
     rows = []
     norm = v_true ** 2
@@ -275,21 +312,28 @@ def run_grid(args):
     corrupt_p_list = [float(x) for x in args.corrupt_p_list.split(",")] if args.corrupt_p_list else []
 
     cells = list(itertools.product(nc_list, eps_list, rstd_list, n_list))
-    print(f"{len(cells)} cells x {len(methods)} methods x {args.n_seeds} seeds "
-          f"(gen={args.gen_clustering_method})")
+    n_partitions = _n_estimation_partitions(methods, corrupt_p_list)
+    tqdm.write(
+        f"{len(cells)} cells x {n_partitions} estimation partitions x "
+        f"{args.n_seeds} seeds (gen={args.gen_clustering_method})"
+    )
 
-    for i, (nc, eps, rstd, n) in enumerate(cells, 1):
+    cell_iter = tqdm(cells, desc="join cells", unit="cell", dynamic_ncols=True)
+    for i, (nc, eps, rstd, n) in enumerate(cell_iter, 1):
         ckpt = out_dir / cell_key(args.gen_clustering_method, nc, eps, rstd, n)
+        cell_desc = f"[{i}/{len(cells)}] nc={nc} eps={eps} rstd={rstd} n={n}"
+        cell_iter.set_postfix(nc=nc, eps=eps, rstd=rstd, n=n)
         if ckpt.exists():
-            print(f"[{i}/{len(cells)}] {ckpt.name}: cached")
+            tqdm.write(f"{cell_desc}: cached ({ckpt.name})")
             continue
-        print(f"[{i}/{len(cells)}] nc={nc} eps={eps} rstd={rstd} n={n} ...")
+        tqdm.write(f"{cell_desc}: starting")
         t0 = time()
         rows = run_cell(args.gen_clustering_method, nc, eps, rstd, n,
-                        methods, corrupt_p_list, args.n_seeds, args.temperature)
+                        methods, corrupt_p_list, args.n_seeds, args.temperature,
+                        progress_desc=cell_desc)
         with open(ckpt, "w") as f:
             json.dump(rows, f, indent=2)
-        print(f"    -> {len(rows)} rows in {(time()-t0)/60:.1f} min")
+        tqdm.write(f"{cell_desc}: wrote {len(rows)} rows in {(time()-t0)/60:.1f} min")
 
 
 # ── Analysis ──
