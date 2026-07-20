@@ -9,15 +9,19 @@ Writes one JSON checkpoint per generating mechanism (a list of per-est-method
 row dicts, same schema as run_join_experiment.run_cell), so the existing
 plotting code's `load()` (list of rows keyed by est_method) works unchanged.
 
+Output layout is flat under --root (default ~/offcem_results), matching the
+existing <root>/join_corruption_original and
+<root>/join_corruption_feature_bucket checkpoints already produced there:
+
 New rows (kmeans/spectral/agglomerative as generator):
-    join_tests/join_tests/join_corruption_<mechanism>/cell_gen-<mechanism>_nc50_eps0.2_rstd3.0_n3000.json
+    <root>/join_corruption_<mechanism>/cell_gen-<mechanism>_nc50_eps0.2_rstd3.0_n3000.json
     estimation methods: original, feature_bucket, kmeans, spectral, agglomerative, matched
 
 Extra columns for existing rows (wfss/dps as generator, spectral/agglomerative
 as new estimation columns -- kept in a separate "_extra" dir so the original
 checkpoints are never touched or reinterpreted):
-    join_tests/join_tests/join_corruption_original_extra/cell_gen-original_..._n3000.json
-    join_tests/join_tests/join_corruption_feature_bucket_extra/cell_gen-feature_bucket_..._n3000.json
+    <root>/join_corruption_original_extra/cell_gen-original_..._n3000.json
+    <root>/join_corruption_feature_bucket_extra/cell_gen-feature_bucket_..._n3000.json
     estimation methods: spectral, agglomerative
 """
 import argparse
@@ -53,8 +57,11 @@ def main():
     p.add_argument(
         "--root",
         type=str,
-        default=str(Path.home() / "offcem_results" / "join_tests" / "join_tests"),
-        help="Base output directory (mirrors the join_tests/join_tests layout).",
+        default=str(Path.home() / "offcem_results"),
+        help="Base output directory. Subdirectories are created flat inside it, "
+        "e.g. <root>/join_corruption_kmeans/cell_gen-kmeans_....json -- matching "
+        "the existing <root>/join_corruption_original and "
+        "<root>/join_corruption_feature_bucket layout.",
     )
     args = p.parse_args()
     root = Path(args.root)
