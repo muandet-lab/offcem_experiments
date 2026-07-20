@@ -20,6 +20,7 @@ checkpoints are never touched or reinterpreted):
     join_tests/join_tests/join_corruption_feature_bucket_extra/cell_gen-feature_bucket_..._n3000.json
     estimation methods: spectral, agglomerative
 """
+import argparse
 import json
 import warnings
 from pathlib import Path
@@ -29,7 +30,6 @@ warnings.filterwarnings("ignore")
 
 from run_join_experiment import run_cell
 
-ROOT = Path("/Users/cispa/Documents/OffCEM/join_tests/join_tests")
 NC, EPS, RSTD, N, SEEDS, TEMP = 50, 0.2, 3.0, 3000, 10, 10.0
 
 ALL_METHODS = ["original", "feature_bucket", "kmeans", "spectral", "agglomerative", "matched"]
@@ -49,8 +49,18 @@ def cell_path(out_dir, gen_method):
 
 
 def main():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--root",
+        type=str,
+        default=str(Path.home() / "offcem_results" / "join_tests" / "join_tests"),
+        help="Base output directory (mirrors the join_tests/join_tests layout).",
+    )
+    args = p.parse_args()
+    root = Path(args.root)
+
     for subdir, gen_method, methods in JOBS:
-        out_dir = ROOT / subdir
+        out_dir = root / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
         ckpt = cell_path(out_dir, gen_method)
         if ckpt.exists():
