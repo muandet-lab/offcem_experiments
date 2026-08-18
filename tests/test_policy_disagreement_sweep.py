@@ -20,6 +20,11 @@ from run_policy_disagreement_sweep import make_failure_map_rows  # noqa: E402
 from run_policy_disagreement_sweep import parse_partitions  # noqa: E402
 from run_policy_disagreement_sweep import policy_value  # noqa: E402
 from run_policy_disagreement_sweep import within_cluster_policy_metrics  # noqa: E402
+from analyze_policy_disagreement_breakpoints import make_boundary_rows  # noqa: E402
+from analyze_policy_disagreement_breakpoints import summarize_cells  # noqa: E402
+from analyze_policy_lc_alignment import correlation_rows  # noqa: E402
+from analyze_policy_lc_alignment import final_lambda_rows  # noqa: E402
+from analyze_policy_lc_alignment import summarize_alignment  # noqa: E402
 
 
 class PolicyDisagreementSweepTest(unittest.TestCase):
@@ -413,6 +418,113 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
             1.0,
         )
         self.assertTrue(breakpoint["breakpoint_vs_dm_exists"])
+
+    def test_tolerance_breakpoint_uses_bootstrap_supported_material_loss(self):
+        rows = []
+        for seed in range(4):
+            rows.append(
+                {
+                    "seed": seed,
+                    "partition": "matched",
+                    "lambda": 0.0,
+                    "tau": 1.0,
+                    "sq_error_offcem": 1.0,
+                    "sq_error_dr": 1.0,
+                    "within_cluster_tv": 0.0,
+                    "within_cluster_chi2": 0.0,
+                    "pairwise_ratio_mse": 0.0,
+                    "lc_dm_mse_pi0": 2.0,
+                    "pairwise_lc_mse": 4.0,
+                    "theorem33_bias": 0.0,
+                    "ARI_to_generating_partition": 1.0,
+                }
+            )
+            rows.append(
+                {
+                    "seed": seed,
+                    "partition": "matched",
+                    "lambda": 0.5,
+                    "tau": 1.0,
+                    "sq_error_offcem": 2.0,
+                    "sq_error_dr": 1.0,
+                    "within_cluster_tv": 0.25,
+                    "within_cluster_chi2": 0.5,
+                    "pairwise_ratio_mse": 1.0,
+                    "lc_dm_mse_pi0": 2.0,
+                    "pairwise_lc_mse": 4.0,
+                    "theorem33_bias": 1.0,
+                    "ARI_to_generating_partition": 1.0,
+                }
+            )
+        cells = summarize_cells(
+            rows,
+            delta=0.1,
+            bootstrap_samples=200,
+            alpha=0.05,
+            random_state=123,
+        )
+        boundary = make_boundary_rows(cells)[0]
+        self.assertTrue(boundary["breakpoint_ci_exists"])
+        self.assertAlmostEqual(boundary["breakpoint_ci_lambda"], 0.05)
+        self.assertAlmostEqual(boundary["breakpoint_ci_D_chi2"], 0.05)
+        self.assertAlmostEqual(boundary["breakpoint_ci_pairwise_ratio_mse"], 0.1)
+
+    def test_policy_lc_alignment_summary_uses_final_lambda(self):
+        rows = []
+        for lam in (0.0, 1.0):
+            for seed in range(3):
+                rows.append(
+                    {
+                        "seed": seed,
+                        "partition": "matched",
+                        "lambda": lam,
+                        "tau": 1.0,
+                        "error_offcem": lam + seed * 0.1,
+                        "sq_error_offcem": 1.0 + lam,
+                        "sq_error_dr": 1.0,
+                        "within_cluster_tv": lam * 0.2,
+                        "within_cluster_chi2": lam * 0.5,
+                        "lc_dm_mse_pi0": 2.0,
+                        "pairwise_lc_mse": 4.0,
+                        "policy_lc_weighted_covariance": -lam,
+                        "theorem33_bias": lam,
+                    }
+                )
+        summaries = summarize_alignment(rows, delta=0.1)
+        final = final_lambda_rows(summaries)
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["lambda"], 1.0)
+        self.assertAlmostEqual(
+            final[0]["abs_policy_lc_weighted_covariance"],
+            1.0,
+        )
+        self.assertTrue(final[0]["materially_worse_than_dr"])
+
+    def test_policy_lc_alignment_correlations_are_emitted(self):
+        rows = []
+        for partition, lc in (("matched", 1.0), ("random", 3.0)):
+            for lam in (0.0, 1.0):
+                for seed in range(2):
+                    rows.append(
+                        {
+                            "seed": seed,
+                            "partition": partition,
+                            "lambda": lam,
+                            "tau": 1.0,
+                            "error_offcem": lc * lam,
+                            "sq_error_offcem": lc * lam + 1.0,
+                            "sq_error_dr": 1.0,
+                            "within_cluster_tv": lam,
+                            "within_cluster_chi2": lam,
+                            "lc_dm_mse_pi0": lc,
+                            "pairwise_lc_mse": lc,
+                            "policy_lc_weighted_covariance": lc * lam,
+                            "theorem33_bias": -lc * lam,
+                        }
+                    )
+        correlations = correlation_rows(summarize_alignment(rows, delta=0.1))
+        self.assertTrue(correlations)
+        self.assertIn("abs_policy_lc_weighted_covariance", {r["x"] for r in correlations})
 
 
 if __name__ == "__main__":
