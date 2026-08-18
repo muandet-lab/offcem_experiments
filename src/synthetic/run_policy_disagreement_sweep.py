@@ -279,6 +279,63 @@ def compute_policy_disagreement(
     return float(disagreement_by_user.mean())
 
 
+def compute_within_cluster_chi2(
+    pi0_population: np.ndarray,
+    pi_lambda: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> float:
+    """Weighted conditional chi-square policy disagreement.
+
+    This is E_x sum_c pi0(c|x) Var_{a~pi0(.|x,c)}[
+    pi(a|x,c) / pi0(a|x,c)].
+    """
+    pi0 = pi0_population[:, :, 0]
+    pi_e = pi_lambda[:, :, 0]
+    n_clusters = int(cluster_labels.max()) + 1
+    disagreement_by_user = np.zeros(pi0.shape[0], dtype=float)
+
+    for c in range(n_clusters):
+        action_mask = cluster_labels == c
+        if not np.any(action_mask):
+            continue
+        pi0_c = pi0[:, action_mask].sum(axis=1)
+        pi_e_c = pi_e[:, action_mask].sum(axis=1)
+        pi0_cond = pi0[:, action_mask] / pi0_c[:, np.newaxis]
+        pi_e_cond = pi_e[:, action_mask] / pi_e_c[:, np.newaxis]
+        ratio = pi_e_cond / np.maximum(pi0_cond, 1e-12)
+        ratio_mean = np.sum(pi0_cond * ratio, axis=1)
+        ratio_var = np.sum(
+            pi0_cond * (ratio - ratio_mean[:, np.newaxis]) ** 2,
+            axis=1,
+        )
+        disagreement_by_user += pi0_c * ratio_var
+
+    return float(disagreement_by_user.mean())
+
+
+def within_cluster_policy_metrics(
+    pi0_population: np.ndarray,
+    pi_lambda: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> Dict[str, float]:
+    """Compute TV, conditional chi-square, and pairwise ratio disagreement."""
+    weighted_tv = compute_policy_disagreement(
+        pi0_population,
+        pi_lambda,
+        cluster_labels,
+    )
+    weighted_chi2 = compute_within_cluster_chi2(
+        pi0_population,
+        pi_lambda,
+        cluster_labels,
+    )
+    return {
+        "within_cluster_tv": weighted_tv,
+        "within_cluster_chi2": weighted_chi2,
+        "pairwise_ratio_mse": float(2.0 * weighted_chi2),
+    }
+
+
 def compute_local_correctness_diagnostics(
     q_population: np.ndarray,
     f_hat: np.ndarray,
@@ -309,8 +366,6 @@ def compute_local_correctness_diagnostics(
     logging_demeaned = np.zeros_like(error)
     pairwise_sum = 0.0
     pairwise_count = 0
-    ratio_pairwise_sum = 0.0
-    ratio_pairwise_count = 0
     n_clusters = int(cluster_labels.max()) + 1
 
     for c in range(n_clusters):
@@ -338,18 +393,6 @@ def compute_local_correctness_diagnostics(
             pairwise_sum += float(pairwise_sq.sum())
             pairwise_count += int(pairwise_sq.size)
 
-            ratio = pi_e_cond = pi_e[:, action_mask] / pi_e[
-                :, action_mask
-            ].sum(axis=1)[:, np.newaxis]
-            ratio = ratio / np.maximum(pi0_cond, 1e-12)
-            ratio_diffs = ratio[:, :, np.newaxis] - ratio[:, np.newaxis, :]
-            weighted_pairwise_sq = (
-                ratio_diffs[:, upper[0], upper[1]] ** 2
-                * pairwise_sq
-            )
-            ratio_pairwise_sum += float(weighted_pairwise_sq.sum())
-            ratio_pairwise_count += int(weighted_pairwise_sq.size)
-
     bias_by_user = np.sum((pi0 - pi_e) * error, axis=1)
     population_bias_formula = float(bias_by_user.mean())
     return {
@@ -359,11 +402,6 @@ def compute_local_correctness_diagnostics(
         "pairwise_lc_mse": (
             float(pairwise_sum / pairwise_count)
             if pairwise_count > 0
-            else np.nan
-        ),
-        "within_cluster_ratio_pairwise_mse": (
-            float(ratio_pairwise_sum / ratio_pairwise_count)
-            if ratio_pairwise_count > 0
             else np.nan
         ),
         "population_bias_formula": population_bias_formula,
@@ -567,7 +605,7 @@ def run_seed(
             )
             assert_cluster_weights_one(pi0_population, pi_lambda, labels)
             true_value = policy_value(q_population, pi_lambda)
-            disagreement = compute_policy_disagreement(
+            policy_metrics = within_cluster_policy_metrics(
                 pi0_population=pi0_population,
                 pi_lambda=pi_lambda,
                 cluster_labels=labels,
@@ -600,7 +638,7 @@ def run_seed(
                     estimate_dr=float(base_estimates["DR"]),
                     estimate_dm=float(base_estimates["DM"]),
                     true_value=true_value,
-                    within_cluster_tv=disagreement,
+                    policy_metrics=policy_metrics,
                     cluster_weight_dev=cluster_weight_max_abs_dev_from_one(
                         pi0_population,
                         pi_lambda,
@@ -632,7 +670,7 @@ def _result_row(
     estimate_dr: float,
     estimate_dm: float,
     true_value: float,
-    within_cluster_tv: float,
+    policy_metrics: Dict[str, float],
     cluster_weight_dev: float,
     ari_to_generating_partition: float,
     diagnostics: Dict[str, float],
@@ -655,10 +693,9 @@ def _result_row(
         "sq_error_offcem": float(error_offcem**2),
         "sq_error_dr": float(error_dr**2),
         "sq_error_dm": float(error_dm**2),
-        "within_cluster_tv": float(within_cluster_tv),
-        "within_cluster_ratio_pairwise_mse": diagnostics[
-            "within_cluster_ratio_pairwise_mse"
-        ],
+        "within_cluster_tv": policy_metrics["within_cluster_tv"],
+        "within_cluster_chi2": policy_metrics["within_cluster_chi2"],
+        "pairwise_ratio_mse": policy_metrics["pairwise_ratio_mse"],
         "cluster_weight_max_abs_dev_from_1": float(cluster_weight_dev),
         "reward_mse": diagnostics["reward_mse"],
         "lc_dm_mse_uniform": diagnostics["lc_dm_mse_uniform"],
@@ -689,10 +726,11 @@ def aggregate_results(rows: Iterable[Dict]) -> List[Dict]:
             "tau": float(tau),
             "true_value_mean": float(true_values.mean()),
             "within_cluster_tv_mean": _mean(items, "within_cluster_tv"),
-            "within_cluster_ratio_pairwise_mse_mean": _mean(
+            "within_cluster_chi2_mean": _mean(
                 items,
-                "within_cluster_ratio_pairwise_mse",
+                "within_cluster_chi2",
             ),
+            "pairwise_ratio_mse_mean": _mean(items, "pairwise_ratio_mse"),
             "cluster_weight_max_abs_dev_from_1_max": float(
                 np.max(
                     [
@@ -766,6 +804,8 @@ def make_failure_map_rows(aggregates: List[Dict]) -> List[Dict]:
                 "L_lc_dm_mse_pi0": row["lc_dm_mse_pi0_mean"],
                 "L_pairwise_lc_mse": row["pairwise_lc_mse_mean"],
                 "D_within_cluster_tv": row["within_cluster_tv_mean"],
+                "D_within_cluster_chi2": row["within_cluster_chi2_mean"],
+                "D_pairwise_ratio_mse": row["pairwise_ratio_mse_mean"],
                 "mse_offcem": row["mse_offcem"],
                 "mse_dr": row["mse_dr"],
                 "mse_dm": row["mse_dm"],
@@ -818,6 +858,16 @@ def make_breakpoint_rows(aggregates: List[Dict]) -> List[Dict]:
                 if first is not None
                 else np.nan
             )
+            base[f"{prefix}_within_cluster_chi2"] = (
+                float(first["within_cluster_chi2_mean"])
+                if first is not None
+                else np.nan
+            )
+            base[f"{prefix}_pairwise_ratio_mse"] = (
+                float(first["pairwise_ratio_mse_mean"])
+                if first is not None
+                else np.nan
+            )
             base[f"{prefix}_mse_margin"] = (
                 float(first[f"offcem_mse_minus_{baseline}"])
                 if first is not None
@@ -861,9 +911,8 @@ def load_tidy_csv(path: Path) -> List[Dict]:
                 "sq_error_dr": float(row["sq_error_dr"]),
                 "sq_error_dm": float(row["sq_error_dm"]),
                 "within_cluster_tv": float(row["within_cluster_tv"]),
-                "within_cluster_ratio_pairwise_mse": float(
-                    row["within_cluster_ratio_pairwise_mse"]
-                ),
+                "within_cluster_chi2": float(row["within_cluster_chi2"]),
+                "pairwise_ratio_mse": float(row["pairwise_ratio_mse"]),
                 "cluster_weight_max_abs_dev_from_1": float(
                     row["cluster_weight_max_abs_dev_from_1"]
                 ),
@@ -932,7 +981,7 @@ def plot_failure_map(aggregates: List[Dict], out_dir: Path) -> None:
                 if not rows_:
                     continue
                 ax.scatter(
-                    [row["within_cluster_tv_mean"] for row in rows_],
+                    [row["within_cluster_chi2_mean"] for row in rows_],
                     [row["lc_dm_mse_pi0_mean"] for row in rows_],
                     marker=markers.get(partition, "o"),
                     s=55,
@@ -941,7 +990,7 @@ def plot_failure_map(aggregates: List[Dict], out_dir: Path) -> None:
                     label=f"{partition} {label_suffix}",
                 )
         ax.set_title(f"vs {baseline.upper()}")
-        ax.set_xlabel("D: within-cluster TV")
+        ax.set_xlabel("D: within-cluster conditional chi-square")
         ax.grid(True, alpha=0.3)
     axes[0].set_ylabel("L: pi0-centered LC MSE")
     handles, labels = axes[0].get_legend_handles_labels()
@@ -1040,6 +1089,37 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(
         out_dir / "policy_disagreement_vs_lambda.png",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for partition in partitions:
+        selected = [
+            row
+            for row in aggregates
+            if row["partition"] == partition
+        ]
+        if not selected:
+            continue
+        selected = sorted(selected, key=lambda row: row["within_cluster_chi2_mean"])
+        ax.plot(
+            [row["within_cluster_chi2_mean"] for row in selected],
+            [abs(row["theorem33_bias_mean"]) for row in selected],
+            marker="o",
+            linewidth=1.4,
+            markersize=4,
+            label=partition,
+            color=colors.get((partition, "offcem")),
+        )
+    ax.set_xlabel("D: within-cluster conditional chi-square")
+    ax.set_ylabel("Absolute theorem33 bias diagnostic")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(
+        out_dir / "offcem_bias_vs_within_cluster_chi2.png",
         dpi=150,
         bbox_inches="tight",
     )

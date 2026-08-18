@@ -14,10 +14,12 @@ from run_policy_disagreement_sweep import build_policy_disagreement_target  # no
 from run_policy_disagreement_sweep import cluster_mass  # noqa: E402
 from run_policy_disagreement_sweep import compute_local_correctness_diagnostics  # noqa: E402
 from run_policy_disagreement_sweep import compute_policy_disagreement  # noqa: E402
+from run_policy_disagreement_sweep import compute_within_cluster_chi2  # noqa: E402
 from run_policy_disagreement_sweep import make_breakpoint_rows  # noqa: E402
 from run_policy_disagreement_sweep import make_failure_map_rows  # noqa: E402
 from run_policy_disagreement_sweep import parse_partitions  # noqa: E402
 from run_policy_disagreement_sweep import policy_value  # noqa: E402
+from run_policy_disagreement_sweep import within_cluster_policy_metrics  # noqa: E402
 
 
 class PolicyDisagreementSweepTest(unittest.TestCase):
@@ -74,6 +76,10 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
             compute_policy_disagreement(self.pi0, pi_e, self.labels),
             0.0,
         )
+        self.assertAlmostEqual(
+            compute_within_cluster_chi2(self.pi0, pi_e, self.labels),
+            0.0,
+        )
 
     def test_policy_disagreement_increases_with_lambda(self):
         pi_mid = build_policy_disagreement_target(
@@ -92,8 +98,52 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         )
         d_mid = compute_policy_disagreement(self.pi0, pi_mid, self.labels)
         d_full = compute_policy_disagreement(self.pi0, pi_full, self.labels)
+        chi2_mid = compute_within_cluster_chi2(self.pi0, pi_mid, self.labels)
+        chi2_full = compute_within_cluster_chi2(self.pi0, pi_full, self.labels)
         self.assertGreater(d_mid, 0.0)
         self.assertGreater(d_full, d_mid)
+        self.assertGreater(chi2_mid, 0.0)
+        self.assertGreater(chi2_full, chi2_mid)
+
+    def test_within_cluster_chi2_matches_conditional_ratio_variance(self):
+        pi_e = build_policy_disagreement_target(
+            self.q,
+            self.pi0,
+            self.labels,
+            lambda_=1.0,
+            tau=1.0,
+        )
+        expected_by_user = np.zeros(self.q.shape[0])
+        for c in (0, 1):
+            mask = self.labels == c
+            pi0_c = self.pi0[:, mask, 0].sum(axis=1)
+            pie_c = pi_e[:, mask, 0].sum(axis=1)
+            pi0_cond = self.pi0[:, mask, 0] / pi0_c[:, None]
+            pie_cond = pi_e[:, mask, 0] / pie_c[:, None]
+            ratio = pie_cond / pi0_cond
+            ratio_mean = np.sum(pi0_cond * ratio, axis=1)
+            ratio_var = np.sum(pi0_cond * (ratio - ratio_mean[:, None]) ** 2, axis=1)
+            expected_by_user += pi0_c * ratio_var
+        self.assertAlmostEqual(
+            compute_within_cluster_chi2(self.pi0, pi_e, self.labels),
+            float(expected_by_user.mean()),
+        )
+
+    def test_within_cluster_policy_metrics_include_pairwise_ratio_mse(self):
+        pi_e = build_policy_disagreement_target(
+            self.q,
+            self.pi0,
+            self.labels,
+            lambda_=1.0,
+            tau=1.0,
+        )
+        metrics = within_cluster_policy_metrics(self.pi0, pi_e, self.labels)
+        self.assertGreater(metrics["within_cluster_tv"], 0.0)
+        self.assertGreater(metrics["within_cluster_chi2"], 0.0)
+        self.assertAlmostEqual(
+            metrics["pairwise_ratio_mse"],
+            2.0 * metrics["within_cluster_chi2"],
+        )
 
     def test_policy_value_uses_population_q(self):
         pi_e = build_policy_disagreement_target(
@@ -170,10 +220,6 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         self.assertGreater(diagnostics["lc_dm_mse_uniform"], 0.0)
         self.assertGreater(diagnostics["lc_dm_mse_pi0"], 0.0)
         self.assertGreater(diagnostics["pairwise_lc_mse"], 0.0)
-        self.assertGreater(
-            diagnostics["within_cluster_ratio_pairwise_mse"],
-            0.0,
-        )
         self.assertAlmostEqual(
             diagnostics["population_bias_formula"],
             expected_bias_proxy,
@@ -214,10 +260,6 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
             diagnostics["policy_lc_weighted_covariance"],
             0.0,
         )
-        self.assertAlmostEqual(
-            diagnostics["within_cluster_ratio_pairwise_mse"],
-            0.0,
-        )
 
     def test_rel_mse_is_seedwise_normalized(self):
         rows = [
@@ -237,7 +279,8 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
                 "sq_error_dr": 1.0,
                 "sq_error_dm": 1.0,
                 "within_cluster_tv": 0.0,
-                "within_cluster_ratio_pairwise_mse": 0.0,
+                "within_cluster_chi2": 0.0,
+                "pairwise_ratio_mse": 0.0,
                 "cluster_weight_max_abs_dev_from_1": 1e-12,
                 "reward_mse": 0.5,
                 "lc_dm_mse_uniform": 1.0,
@@ -264,7 +307,8 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
                 "sq_error_dr": 1.0,
                 "sq_error_dm": 1.0,
                 "within_cluster_tv": 0.0,
-                "within_cluster_ratio_pairwise_mse": 0.0,
+                "within_cluster_chi2": 0.0,
+                "pairwise_ratio_mse": 0.0,
                 "cluster_weight_max_abs_dev_from_1": 2e-12,
                 "reward_mse": 1.5,
                 "lc_dm_mse_uniform": 3.0,
@@ -285,6 +329,7 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         self.assertAlmostEqual(aggregate["mse_dm"], 1.0)
         self.assertAlmostEqual(aggregate["cluster_weight_max_abs_dev_from_1_max"], 2e-12)
         self.assertAlmostEqual(aggregate["reward_mse_mean"], 1.0)
+        self.assertAlmostEqual(aggregate["pairwise_ratio_mse_mean"], 0.0)
         self.assertAlmostEqual(aggregate["lc_dm_mse_uniform_mean"], 2.0)
         self.assertAlmostEqual(aggregate["lc_dm_mse_pi0_mean"], 3.0)
         self.assertAlmostEqual(aggregate["pairwise_lc_mse_mean"], 4.0)
@@ -309,6 +354,8 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
                 "lc_dm_mse_pi0_mean": 1.0,
                 "pairwise_lc_mse_mean": 2.0,
                 "within_cluster_tv_mean": 0.0,
+                "within_cluster_chi2_mean": 0.0,
+                "pairwise_ratio_mse_mean": 0.0,
                 "mse_offcem": 0.5,
                 "mse_dr": 1.0,
                 "mse_dm": 1.5,
@@ -328,6 +375,8 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
                 "lc_dm_mse_pi0_mean": 1.0,
                 "pairwise_lc_mse_mean": 2.0,
                 "within_cluster_tv_mean": 0.25,
+                "within_cluster_chi2_mean": 0.5,
+                "pairwise_ratio_mse_mean": 1.0,
                 "mse_offcem": 2.0,
                 "mse_dr": 1.0,
                 "mse_dm": 1.5,
@@ -345,6 +394,8 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         self.assertEqual(len(failure_rows), 2)
         self.assertEqual(failure_rows[0]["L_lc_dm_mse_pi0"], 1.0)
         self.assertEqual(failure_rows[1]["D_within_cluster_tv"], 0.25)
+        self.assertEqual(failure_rows[1]["D_within_cluster_chi2"], 0.5)
+        self.assertEqual(failure_rows[1]["D_pairwise_ratio_mse"], 1.0)
 
         breakpoint = make_breakpoint_rows(aggregates)[0]
         self.assertTrue(breakpoint["breakpoint_vs_dr_exists"])
@@ -352,6 +403,14 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         self.assertEqual(
             breakpoint["breakpoint_vs_dr_within_cluster_tv"],
             0.25,
+        )
+        self.assertEqual(
+            breakpoint["breakpoint_vs_dr_within_cluster_chi2"],
+            0.5,
+        )
+        self.assertEqual(
+            breakpoint["breakpoint_vs_dr_pairwise_ratio_mse"],
+            1.0,
         )
         self.assertTrue(breakpoint["breakpoint_vs_dm_exists"])
 
