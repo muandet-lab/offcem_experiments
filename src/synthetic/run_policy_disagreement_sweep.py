@@ -61,7 +61,34 @@ DEFAULTS = dict(
 
 PARTITION_LABELS = {
     "matched": "matched",
+    "wfss": "WFSS",
     "kmeans": "kmeans",
+    "spectral": "spectral",
+    "agglomerative": "agglomerative",
+    "dps": "DPS",
+    "random": "random",
+}
+
+PARTITION_METHOD_ALIASES = {
+    "matched": "matched",
+    "wfss": "original",
+    "original": "original",
+    "kmeans": "kmeans",
+    "spectral": "spectral",
+    "agglomerative": "agglomerative",
+    "dps": "feature_bucket",
+    "feature_bucket": "feature_bucket",
+    "random": "random",
+}
+
+PARTITION_OUTPUT_NAMES = {
+    "matched": "matched",
+    "original": "wfss",
+    "kmeans": "kmeans",
+    "spectral": "spectral",
+    "agglomerative": "agglomerative",
+    "feature_bucket": "dps",
+    "random": "random",
 }
 
 ESTIMATOR_LABELS = {
@@ -83,6 +110,15 @@ def parse_args():
     parser.add_argument("--reward-std", type=float, default=3.0)
     parser.add_argument("--beta", type=float, default=DEFAULTS["BETA"])
     parser.add_argument("--lambda-list", type=str, default="0,.25,.5,.75,1")
+    parser.add_argument(
+        "--partitions",
+        type=str,
+        default="matched,wfss,kmeans,spectral,agglomerative,dps,random",
+        help=(
+            "Comma-separated partitions. Supported: matched, wfss/original, "
+            "kmeans, spectral, agglomerative, dps/feature_bucket, random."
+        ),
+    )
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument(
         "--out-dir",
@@ -110,6 +146,24 @@ def parse_lambda_list(value: str) -> List[float]:
     if any(lam < 0.0 or lam > 1.0 for lam in lambdas):
         raise ValueError("lambda values must lie in [0, 1]")
     return sorted(set(lambdas))
+
+
+def parse_partitions(value: str) -> List[str]:
+    names = []
+    for item in value.split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        key = raw.lower()
+        if key not in PARTITION_METHOD_ALIASES:
+            supported = ", ".join(sorted(PARTITION_METHOD_ALIASES))
+            raise ValueError(f"unknown partition {raw!r}; supported: {supported}")
+        output_name = PARTITION_OUTPUT_NAMES[PARTITION_METHOD_ALIASES[key]]
+        if output_name not in names:
+            names.append(output_name)
+    if not names:
+        raise ValueError("--partitions must contain at least one partition")
+    return names
 
 
 def make_dataset(seed: int, n_actions: int, beta: float, reward_std: float):
@@ -322,19 +376,24 @@ def build_fixed_partitions(
     bandit_data: Dict,
     n_clusters: int,
     seed: int,
+    partition_names: List[str],
 ) -> Dict[str, np.ndarray]:
     estimation_seed = seed + DEFAULTS["ESTIMATION_SEED_OFFSET"]
-    kmeans = compute_clusters(
-        action_features=bandit_data["action_context_one_hot"],
-        n_clusters=n_clusters,
-        method="kmeans",
-        balance="natural",
-        random_state=estimation_seed,
-    )
-    return {
-        "matched": bandit_data["cluster_indices"].copy(),
-        "kmeans": kmeans,
-    }
+    partitions = {}
+    for partition in partition_names:
+        if partition == "matched":
+            partitions[partition] = bandit_data["cluster_indices"].copy()
+            continue
+        method = PARTITION_METHOD_ALIASES[partition]
+        partitions[partition] = compute_clusters(
+            action_features=bandit_data["action_context_one_hot"],
+            n_clusters=n_clusters,
+            method=method,
+            balance="natural",
+            random_state=estimation_seed,
+            temperature=10.0,
+        )
+    return partitions
 
 
 def fit_action_reward_model(
@@ -437,6 +496,7 @@ def run_seed(
     reward_std: float,
     lambda_list: List[float],
     tau: float,
+    partition_names: List[str],
 ) -> List[Dict]:
     seed = DEFAULTS["RANDOM_STATE"] + seed_index
     dataset = make_dataset(
@@ -462,6 +522,7 @@ def run_seed(
         bandit_data=bandit_data,
         n_clusters=n_clusters,
         seed=seed,
+        partition_names=partition_names,
     )
     ari_to_generating = {
         partition: float(
@@ -677,8 +738,93 @@ def aggregate_results(rows: Iterable[Dict]) -> List[Dict]:
             row[f"variance_{estimator}"] = float(
                 np.mean((errors - errors.mean()) ** 2)
             )
+        row["offcem_loses_to_dr"] = bool(row["mse_offcem"] > row["mse_dr"])
+        row["offcem_loses_to_dm"] = bool(row["mse_offcem"] > row["mse_dm"])
+        row["offcem_mse_minus_dr"] = float(row["mse_offcem"] - row["mse_dr"])
+        row["offcem_mse_minus_dm"] = float(row["mse_offcem"] - row["mse_dm"])
+        row["offcem_rel_mse_minus_dr"] = float(
+            row["rel_mse_offcem"] - row["rel_mse_dr"]
+        )
+        row["offcem_rel_mse_minus_dm"] = float(
+            row["rel_mse_offcem"] - row["rel_mse_dm"]
+        )
         aggregates.append(row)
     return aggregates
+
+
+def make_failure_map_rows(aggregates: List[Dict]) -> List[Dict]:
+    rows = []
+    for row in sorted(
+        aggregates,
+        key=lambda item: (item["partition"], item["tau"], item["lambda"]),
+    ):
+        rows.append(
+            {
+                "partition": row["partition"],
+                "lambda": row["lambda"],
+                "tau": row["tau"],
+                "L_lc_dm_mse_pi0": row["lc_dm_mse_pi0_mean"],
+                "L_pairwise_lc_mse": row["pairwise_lc_mse_mean"],
+                "D_within_cluster_tv": row["within_cluster_tv_mean"],
+                "mse_offcem": row["mse_offcem"],
+                "mse_dr": row["mse_dr"],
+                "mse_dm": row["mse_dm"],
+                "rel_mse_offcem": row["rel_mse_offcem"],
+                "rel_mse_dr": row["rel_mse_dr"],
+                "rel_mse_dm": row["rel_mse_dm"],
+                "offcem_loses_to_dr": row["offcem_loses_to_dr"],
+                "offcem_loses_to_dm": row["offcem_loses_to_dm"],
+                "offcem_mse_minus_dr": row["offcem_mse_minus_dr"],
+                "offcem_mse_minus_dm": row["offcem_mse_minus_dm"],
+                "ARI_to_generating_partition_mean": row[
+                    "ARI_to_generating_partition_mean"
+                ],
+            }
+        )
+    return rows
+
+
+def make_breakpoint_rows(aggregates: List[Dict]) -> List[Dict]:
+    grouped = {}
+    for row in aggregates:
+        grouped.setdefault((row["partition"], row["tau"]), []).append(row)
+
+    rows = []
+    for (partition, tau), items in sorted(grouped.items()):
+        items = sorted(items, key=lambda row: row["lambda"])
+        base = {
+            "partition": partition,
+            "tau": tau,
+            "ARI_to_generating_partition_mean": items[0][
+                "ARI_to_generating_partition_mean"
+            ],
+            "lc_dm_mse_pi0_mean": items[0]["lc_dm_mse_pi0_mean"],
+            "pairwise_lc_mse_mean": items[0]["pairwise_lc_mse_mean"],
+        }
+        for baseline in ("dr", "dm"):
+            crossing = [
+                row
+                for row in items
+                if row[f"offcem_loses_to_{baseline}"]
+            ]
+            first = crossing[0] if crossing else None
+            prefix = f"breakpoint_vs_{baseline}"
+            base[f"{prefix}_exists"] = bool(first is not None)
+            base[f"{prefix}_lambda"] = (
+                float(first["lambda"]) if first is not None else np.nan
+            )
+            base[f"{prefix}_within_cluster_tv"] = (
+                float(first["within_cluster_tv_mean"])
+                if first is not None
+                else np.nan
+            )
+            base[f"{prefix}_mse_margin"] = (
+                float(first[f"offcem_mse_minus_{baseline}"])
+                if first is not None
+                else np.nan
+            )
+        rows.append(base)
+    return rows
 
 
 def _mean(items: List[Dict], key: str) -> float:
@@ -740,6 +886,78 @@ def load_tidy_csv(path: Path) -> List[Dict]:
         ]
 
 
+def _ordered_partitions(aggregates: List[Dict]) -> List[str]:
+    preferred = ["matched", "wfss", "kmeans", "spectral", "agglomerative", "dps"]
+    observed = sorted({row["partition"] for row in aggregates})
+    return [p for p in preferred if p in observed] + [
+        p for p in observed if p not in preferred
+    ]
+
+
+def plot_failure_map(aggregates: List[Dict], out_dir: Path) -> None:
+    partitions = _ordered_partitions(aggregates)
+    markers = {
+        "matched": "o",
+        "wfss": "s",
+        "kmeans": "^",
+        "spectral": "D",
+        "agglomerative": "P",
+        "dps": "X",
+        "random": "v",
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.8), sharey=True)
+    for ax, baseline in zip(axes, ("dr", "dm")):
+        for partition in partitions:
+            selected = [
+                row
+                for row in aggregates
+                if row["partition"] == partition
+            ]
+            if not selected:
+                continue
+            wins = [
+                row
+                for row in selected
+                if not row[f"offcem_loses_to_{baseline}"]
+            ]
+            losses = [
+                row
+                for row in selected
+                if row[f"offcem_loses_to_{baseline}"]
+            ]
+            for rows_, color, label_suffix in (
+                (wins, "#2ca02c", "OffCEM <= baseline"),
+                (losses, "#d62728", "OffCEM > baseline"),
+            ):
+                if not rows_:
+                    continue
+                ax.scatter(
+                    [row["within_cluster_tv_mean"] for row in rows_],
+                    [row["lc_dm_mse_pi0_mean"] for row in rows_],
+                    marker=markers.get(partition, "o"),
+                    s=55,
+                    color=color,
+                    alpha=0.8,
+                    label=f"{partition} {label_suffix}",
+                )
+        ax.set_title(f"vs {baseline.upper()}")
+        ax.set_xlabel("D: within-cluster TV")
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("L: pi0-centered LC MSE")
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    fig.legend(
+        by_label.values(),
+        by_label.keys(),
+        loc="lower center",
+        ncol=3,
+        fontsize=7,
+    )
+    fig.tight_layout(rect=(0, 0.12, 1, 1))
+    fig.savefig(out_dir / "failure_map.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
     metrics = [
         ("bias2", "Bias^2", "bias2_vs_lambda.png"),
@@ -749,13 +967,26 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
         ("matched", "offcem"): "#1f77b4",
         ("matched", "dr"): "#d62728",
         ("matched", "dm"): "#9467bd",
+        ("wfss", "offcem"): "#17becf",
+        ("wfss", "dr"): "#bcbd22",
+        ("wfss", "dm"): "#7f7f7f",
         ("kmeans", "offcem"): "#2ca02c",
         ("kmeans", "dr"): "#ff7f0e",
         ("kmeans", "dm"): "#8c564b",
+        ("spectral", "offcem"): "#e377c2",
+        ("spectral", "dr"): "#aec7e8",
+        ("spectral", "dm"): "#ffbb78",
+        ("agglomerative", "offcem"): "#98df8a",
+        ("agglomerative", "dr"): "#ff9896",
+        ("agglomerative", "dm"): "#c5b0d5",
+        ("dps", "offcem"): "#9467bd",
+        ("dps", "dr"): "#c49c94",
+        ("dps", "dm"): "#f7b6d2",
     }
+    partitions = _ordered_partitions(aggregates)
     for key, ylabel, filename in metrics:
         fig, ax = plt.subplots(figsize=(8, 5))
-        for partition in ("matched", "kmeans"):
+        for partition in partitions:
             for estimator in ("offcem", "dr", "dm"):
                 selected = [
                     row
@@ -784,7 +1015,7 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
         plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for partition in ("matched", "kmeans"):
+    for partition in partitions:
         selected = [
             row
             for row in aggregates
@@ -820,7 +1051,7 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
         ("lc_dm_mse_pi0_mean", "--"),
         ("theorem33_bias_mean", ":"),
     ):
-        for partition in ("matched", "kmeans"):
+        for partition in partitions:
             selected = [
                 row
                 for row in aggregates
@@ -849,6 +1080,18 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
         bbox_inches="tight",
     )
     plt.close(fig)
+    plot_failure_map(aggregates, out_dir)
+
+
+def write_derived_outputs(
+    aggregates: List[Dict],
+    out_dir: Path,
+    no_plot: bool,
+) -> None:
+    write_csv(out_dir / "failure_map.csv", make_failure_map_rows(aggregates))
+    write_csv(out_dir / "breakpoint_summary.csv", make_breakpoint_rows(aggregates))
+    if not no_plot:
+        plot_aggregates(aggregates, out_dir)
 
 
 def run_experiment(args) -> None:
@@ -856,7 +1099,8 @@ def run_experiment(args) -> None:
         args.n_rounds = 1000
         args.n_seeds = 2
         args.lambda_list = "0,1"
-        print("[quick] n_rounds=1000 n_seeds=2 lambda=0,1")
+        args.partitions = "matched,kmeans"
+        print("[quick] n_rounds=1000 n_seeds=2 lambda=0,1 partitions=matched,kmeans")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -867,11 +1111,11 @@ def run_experiment(args) -> None:
         rows = load_tidy_csv(tidy_path)
         aggregates = aggregate_results(rows)
         write_csv(aggregate_path, aggregates)
-        if not args.no_plot:
-            plot_aggregates(aggregates, out_dir)
+        write_derived_outputs(aggregates, out_dir, args.no_plot)
         return
 
     lambda_list = parse_lambda_list(args.lambda_list)
+    partition_names = parse_partitions(args.partitions)
     all_rows = []
     started = time()
     for seed_index in tqdm(range(args.n_seeds), desc="policy-disagreement seeds"):
@@ -886,6 +1130,7 @@ def run_experiment(args) -> None:
                 reward_std=args.reward_std,
                 lambda_list=lambda_list,
                 tau=args.tau,
+                partition_names=partition_names,
             )
         )
         with open(out_dir / "latest_rows.json", "w") as file:
@@ -894,13 +1139,14 @@ def run_experiment(args) -> None:
     aggregates = aggregate_results(all_rows)
     write_csv(tidy_path, all_rows)
     write_csv(aggregate_path, aggregates)
-    if not args.no_plot:
-        plot_aggregates(aggregates, out_dir)
+    write_derived_outputs(aggregates, out_dir, args.no_plot)
     elapsed = (time() - started) / 60
     print(f"wrote {tidy_path}")
     print(f"wrote {aggregate_path}")
     if not args.no_plot:
-        print(f"wrote plots to {out_dir}")
+        print(f"wrote derived outputs and plots to {out_dir}")
+    else:
+        print(f"wrote derived outputs to {out_dir}")
     print(f"done in {elapsed:.1f} min")
 
 

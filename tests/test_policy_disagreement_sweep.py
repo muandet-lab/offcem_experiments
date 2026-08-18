@@ -9,10 +9,14 @@ SYNTHETIC = Path(__file__).resolve().parents[1] / "src" / "synthetic"
 sys.path.insert(0, str(SYNTHETIC))
 
 from run_policy_disagreement_sweep import aggregate_results  # noqa: E402
+from run_policy_disagreement_sweep import build_fixed_partitions  # noqa: E402
 from run_policy_disagreement_sweep import build_policy_disagreement_target  # noqa: E402
 from run_policy_disagreement_sweep import cluster_mass  # noqa: E402
 from run_policy_disagreement_sweep import compute_local_correctness_diagnostics  # noqa: E402
 from run_policy_disagreement_sweep import compute_policy_disagreement  # noqa: E402
+from run_policy_disagreement_sweep import make_breakpoint_rows  # noqa: E402
+from run_policy_disagreement_sweep import make_failure_map_rows  # noqa: E402
+from run_policy_disagreement_sweep import parse_partitions  # noqa: E402
 from run_policy_disagreement_sweep import policy_value  # noqa: E402
 
 
@@ -101,6 +105,41 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
         )
         expected = float(np.sum(self.q * self.pi0[:, :, 0], axis=1).mean())
         self.assertAlmostEqual(policy_value(self.q, pi_e), expected)
+
+    def test_parse_partitions_accepts_wfss_and_dps_aliases(self):
+        self.assertEqual(
+            parse_partitions(
+                "matched,original,wfss,feature_bucket,dps,kmeans,random"
+            ),
+            ["matched", "wfss", "dps", "kmeans", "random"],
+        )
+
+    def test_build_fixed_partitions_supports_added_methods(self):
+        bandit_data = {
+            "action_context_one_hot": np.array(
+                [
+                    [0.0, 0.0],
+                    [0.1, 0.0],
+                    [0.2, 0.1],
+                    [2.0, 2.0],
+                    [2.1, 2.0],
+                    [2.2, 2.1],
+                ]
+            ),
+            "cluster_indices": np.array([0, 0, 0, 1, 1, 1]),
+        }
+        partitions = build_fixed_partitions(
+            bandit_data,
+            n_clusters=2,
+            seed=123,
+            partition_names=["matched", "wfss", "dps", "kmeans", "random"],
+        )
+        self.assertEqual(
+            set(partitions),
+            {"matched", "wfss", "dps", "kmeans", "random"},
+        )
+        for labels in partitions.values():
+            self.assertEqual(labels.shape, (6,))
 
     def test_local_correctness_diagnostics(self):
         f_hat = (self.q + np.array(
@@ -256,6 +295,65 @@ class PolicyDisagreementSweepTest(unittest.TestCase):
             0.2,
         )
         self.assertAlmostEqual(aggregate["ARI_to_generating_partition_mean"], 1.0)
+        self.assertTrue(aggregate["offcem_loses_to_dr"])
+        self.assertTrue(aggregate["offcem_loses_to_dm"])
+        self.assertAlmostEqual(aggregate["offcem_mse_minus_dr"], 3.0)
+        self.assertAlmostEqual(aggregate["offcem_mse_minus_dm"], 3.0)
+
+    def test_failure_map_and_breakpoint_outputs(self):
+        aggregates = [
+            {
+                "partition": "matched",
+                "lambda": 0.0,
+                "tau": 1.0,
+                "lc_dm_mse_pi0_mean": 1.0,
+                "pairwise_lc_mse_mean": 2.0,
+                "within_cluster_tv_mean": 0.0,
+                "mse_offcem": 0.5,
+                "mse_dr": 1.0,
+                "mse_dm": 1.5,
+                "rel_mse_offcem": 0.05,
+                "rel_mse_dr": 0.1,
+                "rel_mse_dm": 0.15,
+                "offcem_loses_to_dr": False,
+                "offcem_loses_to_dm": False,
+                "offcem_mse_minus_dr": -0.5,
+                "offcem_mse_minus_dm": -1.0,
+                "ARI_to_generating_partition_mean": 1.0,
+            },
+            {
+                "partition": "matched",
+                "lambda": 0.5,
+                "tau": 1.0,
+                "lc_dm_mse_pi0_mean": 1.0,
+                "pairwise_lc_mse_mean": 2.0,
+                "within_cluster_tv_mean": 0.25,
+                "mse_offcem": 2.0,
+                "mse_dr": 1.0,
+                "mse_dm": 1.5,
+                "rel_mse_offcem": 0.2,
+                "rel_mse_dr": 0.1,
+                "rel_mse_dm": 0.15,
+                "offcem_loses_to_dr": True,
+                "offcem_loses_to_dm": True,
+                "offcem_mse_minus_dr": 1.0,
+                "offcem_mse_minus_dm": 0.5,
+                "ARI_to_generating_partition_mean": 1.0,
+            },
+        ]
+        failure_rows = make_failure_map_rows(aggregates)
+        self.assertEqual(len(failure_rows), 2)
+        self.assertEqual(failure_rows[0]["L_lc_dm_mse_pi0"], 1.0)
+        self.assertEqual(failure_rows[1]["D_within_cluster_tv"], 0.25)
+
+        breakpoint = make_breakpoint_rows(aggregates)[0]
+        self.assertTrue(breakpoint["breakpoint_vs_dr_exists"])
+        self.assertEqual(breakpoint["breakpoint_vs_dr_lambda"], 0.5)
+        self.assertEqual(
+            breakpoint["breakpoint_vs_dr_within_cluster_tv"],
+            0.25,
+        )
+        self.assertTrue(breakpoint["breakpoint_vs_dm_exists"])
 
 
 if __name__ == "__main__":
