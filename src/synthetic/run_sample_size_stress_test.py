@@ -659,6 +659,7 @@ def run_world(
     arms: List[str],
     nuisance_train_rounds: int,
     base_model_seed: int,
+    progress=None,
 ) -> List[Dict]:
     world_seed = DEFAULTS["RANDOM_STATE"] + world_index
     world = generate_world(world_seed, n_clusters, eps, reward_std)
@@ -674,6 +675,10 @@ def run_world(
 
     frozen_models = None
     if "frozen" in arms:
+        if progress is not None:
+            progress.set_postfix_str(
+                f"world={world_index + 1} training frozen nuisance models"
+            )
         nuisance_stream = sample_logged_stream(
             world,
             n_rounds=nuisance_train_rounds,
@@ -751,6 +756,11 @@ def run_world(
                 _append_estimates(
                     rows, "frozen", prefix, world, stream_index, model_seed,
                     partition_sweep, frozen_q, frozen_f, frozen_diagnostics,
+                )
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix_str(
+                    f"world={world_index + 1} stream={stream_index + 1}/{n_streams} n={n}"
                 )
     return rows
 
@@ -1110,7 +1120,10 @@ def run_experiment(args) -> None:
         raise ValueError("--nuisance-train-rounds must be positive")
     all_rows = []
     started = time()
-    for world_index in tqdm(range(n_worlds), desc="sample-size worlds"):
+    total_prefixes = n_worlds * args.n_streams * len(n_list)
+    progress = tqdm(total=total_prefixes, desc="sample-size stream prefixes")
+    for world_index in range(n_worlds):
+        progress.set_postfix_str(f"world={world_index + 1} initializing")
         all_rows.extend(
             run_world(
                 world_index=world_index,
@@ -1124,10 +1137,12 @@ def run_experiment(args) -> None:
                 arms=arms,
                 nuisance_train_rounds=args.nuisance_train_rounds,
                 base_model_seed=args.base_model_seed,
+                progress=progress,
             )
         )
         with open(out_dir / "latest_rows.json", "w") as file:
             json.dump(all_rows, file, indent=2)
+    progress.close()
 
     aggregates = aggregate_results(all_rows)
     write_csv(tidy_path, all_rows)
