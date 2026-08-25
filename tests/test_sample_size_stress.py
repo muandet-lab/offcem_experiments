@@ -11,7 +11,12 @@ sys.path.insert(0, str(SYNTHETIC))
 from clustering import compute_clusters  # noqa: E402
 from run_sample_size_stress_test import build_feedback_prefix  # noqa: E402
 from run_sample_size_stress_test import build_fixed_estimation_partitions  # noqa: E402
+from run_sample_size_stress_test import build_partition_sweep  # noqa: E402
+from run_sample_size_stress_test import aggregate_results  # noqa: E402
+from run_sample_size_stress_test import generate_world  # noqa: E402
+from run_sample_size_stress_test import plot_errorbars_by_group  # noqa: E402
 from run_sample_size_stress_test import population_policy_value  # noqa: E402
+from run_sample_size_stress_test import sample_logged_stream  # noqa: E402
 
 
 class SampleSizeStressPrefixTest(unittest.TestCase):
@@ -145,6 +150,99 @@ class SampleSizeStressPrefixTest(unittest.TestCase):
         )
         for labels in partitions.values():
             self.assertEqual(labels.shape, (3,))
+
+    def test_plot_errorbars_are_bootstrapped_by_metric(self):
+        rows = [
+            {
+                "n": 500,
+                "seed": 0,
+                "estimator": "DR",
+                "estimate": 11.0,
+                "true_value": 10.0,
+                "squared_error": 1.0,
+            },
+            {
+                "n": 500,
+                "seed": 1,
+                "estimator": "DR",
+                "estimate": 14.0,
+                "true_value": 10.0,
+                "squared_error": 16.0,
+            },
+            {
+                "n": 1000,
+                "seed": 0,
+                "estimator": "DR",
+                "estimate": 12.0,
+                "true_value": 10.0,
+                "squared_error": 4.0,
+            },
+        ]
+        errorbars = plot_errorbars_by_group(rows)
+        self.assertIn((500, "DR"), errorbars)
+        self.assertGreater(errorbars[(500, "DR")]["rel_mse"], 0.0)
+        self.assertGreater(errorbars[(500, "DR")]["bias2"], 0.0)
+        self.assertEqual(errorbars[(1000, "DR")]["rel_mse"], 0.0)
+
+    def test_fixed_world_is_independent_of_stream_length(self):
+        world = generate_world(
+            world_seed=17,
+            n_clusters=2,
+            eps=0.2,
+            reward_std=3.0,
+        )
+        short = sample_logged_stream(world, 3, stream_seed=91, reward_std=3.0)
+        long = sample_logged_stream(world, 6, stream_seed=91, reward_std=3.0)
+        np.testing.assert_array_equal(
+            short["fixed_expected_rewards"], long["fixed_expected_rewards"]
+        )
+        np.testing.assert_array_equal(
+            short["cluster_indices"], long["cluster_indices"]
+        )
+        for key in ("user_idx", "action", "reward"):
+            np.testing.assert_array_equal(short[key], long[key][:3])
+
+    def test_partition_sweep_has_deterministic_corruption_levels(self):
+        world = generate_world(
+            world_seed=18,
+            n_clusters=2,
+            eps=0.2,
+            reward_std=3.0,
+        )
+        first = build_partition_sweep(
+            world, 2, 100, ["matched", "corrupt"], [0.0, 0.5]
+        )
+        second = build_partition_sweep(
+            world, 2, 100, ["matched", "corrupt"], [0.0, 0.5]
+        )
+        self.assertEqual(set(first), {"matched", "matched_corrupt_0", "matched_corrupt_0.5"})
+        np.testing.assert_array_equal(first["matched"]["labels"], world["cluster_indices"])
+        for key in first:
+            np.testing.assert_array_equal(first[key]["labels"], second[key]["labels"])
+
+    def test_hierarchical_aggregation_averages_within_world_first(self):
+        rows = []
+        for world_seed, errors in ((1, (1.0, 3.0)), (2, (-2.0, -4.0))):
+            for stream_index, error in enumerate(errors):
+                rows.append(
+                    {
+                        "n": 500,
+                        "seed": world_seed,
+                        "world_seed": world_seed,
+                        "stream_seed": 100 + stream_index,
+                        "arm": "end_to_end",
+                        "partition": "matched",
+                        "estimator": "OffCEM matched",
+                        "estimate": 10.0 + error,
+                        "true_value": 10.0,
+                        "squared_error": error**2,
+                    }
+                )
+        aggregate = aggregate_results(rows)[0]
+        self.assertAlmostEqual(aggregate["mse"], 7.5)
+        self.assertAlmostEqual(aggregate["bias2"], 6.5)
+        self.assertAlmostEqual(aggregate["variance"], 1.0)
+        self.assertAlmostEqual(aggregate["rel_mse"], 0.075)
 
 
 if __name__ == "__main__":

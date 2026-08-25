@@ -144,6 +144,7 @@ def train_pairwise_model(
     bandit_data: dict,
     cluster_idx_mat: np.ndarray,
     n_clusters: int,
+    prediction_context: Optional[np.ndarray] = None,
     lr: float = 1e-2,
     batch_size: int = 128,
     num_epochs: int = 30,
@@ -179,7 +180,9 @@ def train_pairwise_model(
             print(_, np.average(losses))
         loss_list.append(np.average(losses))
         scheduler.step()
-    x = torch.from_numpy(bandit_data["context"]).float()
+    if prediction_context is None:
+        prediction_context = bandit_data["context"]
+    x = torch.from_numpy(prediction_context).float()
     h_hat_mat = model.rel_reward_pred(x).detach().numpy()
 
     return h_hat_mat
@@ -190,6 +193,7 @@ def train_reward_model_via_two_stage(
     clusters: np.ndarray,
     need_q_x_a: bool = True,
     random_state: int = 12345,
+    prediction_context: Optional[np.ndarray] = None,
 ) -> np.ndarray:
 
     ### two-step reward regression for the proposed estimator ###
@@ -200,10 +204,29 @@ def train_reward_model_via_two_stage(
     cluster_idx_mat = rankdata(cluster_idx_mat, method="dense", axis=1) - 1
     n_clusters = np.unique(cluster_idx_mat).shape[0]
 
-    h_hat_mat = train_pairwise_model(bandit_data, cluster_idx_mat, n_clusters)
+    predict_logged_rows = prediction_context is None
+    if predict_logged_rows:
+        prediction_context = bandit_data["context"]
+        prediction_user_idx = bandit_data["user_idx"]
+    else:
+        prediction_context = np.asarray(prediction_context)
+        prediction_user_idx = np.arange(prediction_context.shape[0])
+
+    h_hat_mat = train_pairwise_model(
+        bandit_data,
+        cluster_idx_mat,
+        n_clusters,
+        prediction_context=prediction_context,
+    )
     reward_residual = bandit_data["reward"].astype(float)
+    train_prediction_idx = (
+        np.arange(bandit_data["context"].shape[0])
+        if predict_logged_rows
+        else bandit_data["user_idx"]
+    )
     reward_residual -= h_hat_mat[
-        np.arange(bandit_data["context"].shape[0]), bandit_data["action"]
+        train_prediction_idx,
+        bandit_data["action"],
     ]
 
     reg_model = RegressionModel(
@@ -212,14 +235,15 @@ def train_reward_model_via_two_stage(
         base_model=MLP(hidden_layer_sizes=(50, 50, 50), random_state=random_state),
     )
     observed_cluster = cluster_idx_mat[bandit_data["user_idx"], bandit_data["action"]]
-    g_hat_mat = reg_model.fit_predict(
+    reg_model.fit(
         context=bandit_data["context"],
         action=observed_cluster,
         reward=reward_residual,
-    )[:, :, 0]
+    )
+    g_hat_mat = reg_model.predict(context=prediction_context)[:, :, 0]
 
     f_x_a_e = h_hat_mat
-    cluster_idx_mat_ = cluster_idx_mat[bandit_data["user_idx"]]
+    cluster_idx_mat_ = cluster_idx_mat[prediction_user_idx]
     for i in np.arange(f_x_a_e.shape[0]):
         f_x_a_e[i] += g_hat_mat[i][cluster_idx_mat_[i]]
     f_x_a_e = f_x_a_e[:, :, np.newaxis]
@@ -234,11 +258,12 @@ def train_reward_model_via_two_stage(
                 random_state=random_state,
             ),
         )
-        q_x_a = reg_model.fit_predict(
+        reg_model.fit(
             context=bandit_data["context"],
             action=bandit_data["action"],
             reward=bandit_data["reward"],
         )
+        q_x_a = reg_model.predict(context=prediction_context)
 
         return f_x_a_e, q_x_a
 

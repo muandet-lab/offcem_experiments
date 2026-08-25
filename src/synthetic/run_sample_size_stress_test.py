@@ -33,11 +33,13 @@ from tqdm import tqdm
 
 from clustering import clusters_to_onehot_3d
 from clustering import compute_clusters
+from clustering import corrupt_partition
 from dataset import SyntheticBanditDataset
 from ope import OffCEM
 from ope import OffPolicyEvaluation
 from ope import train_reward_model_via_two_stage
 from policy import gen_eps_greedy
+from sklearn.metrics import adjusted_rand_score
 
 
 DEFAULTS = dict(
@@ -52,6 +54,9 @@ DEFAULTS = dict(
     REWARD_TYPE="continuous",
     RANDOM_STATE=12345,
     ESTIMATION_SEED_OFFSET=100000,
+    STREAM_SEED_OFFSET=200000,
+    NUISANCE_STREAM_SEED_OFFSET=300000,
+    MODEL_SEED_OFFSET=400000,
 )
 
 ROUND_LEVEL_FIELDS = (
@@ -66,6 +71,8 @@ ROUND_LEVEL_FIELDS = (
 )
 
 WORLD_LEVEL_FIELDS = (
+    "world_seed",
+    "stream_seed",
     "n_users",
     "n_actions",
     "clusters",
@@ -99,9 +106,51 @@ def parse_args():
         help="Comma-separated logged prefix sizes",
     )
     parser.add_argument("--n-seeds", type=int, default=10)
+    parser.add_argument(
+        "--n-worlds",
+        type=int,
+        default=None,
+        help="Number of independent worlds; defaults to --n-seeds for compatibility",
+    )
+    parser.add_argument(
+        "--n-streams",
+        type=int,
+        default=1,
+        help="Independent logged streams sampled per fixed world",
+    )
     parser.add_argument("--n-clusters", type=int, default=50)
     parser.add_argument("--eps", type=float, default=0.2)
     parser.add_argument("--reward-std", type=float, default=3.0)
+    parser.add_argument(
+        "--partitions",
+        type=str,
+        default="matched,wfss,kmeans,corrupt",
+        help="Comma-separated: matched,wfss,kmeans,corrupt",
+    )
+    parser.add_argument(
+        "--corruption-levels",
+        type=str,
+        default="0,0.1,0.25,0.5,0.75,1",
+        help="Comma-separated matched-partition corruption probabilities",
+    )
+    parser.add_argument(
+        "--arms",
+        type=str,
+        default="end_to_end",
+        help="Comma-separated: end_to_end,frozen",
+    )
+    parser.add_argument(
+        "--nuisance-train-rounds",
+        type=int,
+        default=30000,
+        help="Independent training-stream size for the frozen-nuisance arm",
+    )
+    parser.add_argument(
+        "--base-model-seed",
+        type=int,
+        default=DEFAULTS["MODEL_SEED_OFFSET"],
+        help="Model RNG offset; intentionally independent of n and stream",
+    )
     parser.add_argument(
         "--out-dir",
         type=str,
@@ -128,6 +177,20 @@ def parse_n_list(value: str) -> List[int]:
     if any(n <= 0 for n in n_list):
         raise ValueError("all n values must be positive")
     return sorted(set(n_list))
+
+
+def parse_name_list(value: str, name: str) -> List[str]:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise ValueError(f"--{name} must contain at least one value")
+    return items
+
+
+def parse_float_list(value: str, name: str) -> List[float]:
+    values = [float(item) for item in value.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"--{name} must contain at least one value")
+    return values
 
 
 def make_dataset(seed: int, reward_std: float) -> SyntheticBanditDataset:
@@ -163,6 +226,45 @@ def population_policy_value(
         ).mean()
     )
     return true_value, pi_e_population
+
+
+def generate_world(
+    world_seed: int,
+    n_clusters: int,
+    eps: float,
+    reward_std: float,
+) -> Dict:
+    """Generate one fixed population and attach its target-policy value."""
+    dataset = make_dataset(seed=world_seed, reward_std=reward_std)
+    world = dataset.generate_fixed_world(
+        n_users=DEFAULTS["N_USERS"],
+        n_clusters=n_clusters,
+        clustering_method="original",
+        cluster_balance="natural",
+        cluster_temperature=10.0,
+        world_seed=world_seed,
+    )
+    true_value, pi_e_population = population_policy_value(
+        world["fixed_expected_rewards"], eps=eps
+    )
+    world["pi_e_population"] = pi_e_population
+    world["true_value"] = true_value
+    return world
+
+
+def sample_logged_stream(
+    world: Dict,
+    n_rounds: int,
+    stream_seed: int,
+    reward_std: float,
+) -> Dict:
+    """Sample one independent logged stream without changing the world."""
+    dataset = make_dataset(seed=int(world["world_seed"]), reward_std=reward_std)
+    return dataset.sample_logged_stream(
+        world=world,
+        n_rounds=n_rounds,
+        stream_seed=stream_seed,
+    )
 
 
 def build_feedback_prefix(full_bandit_data: Dict, n: int) -> Dict:
@@ -253,9 +355,69 @@ def build_fixed_estimation_partitions(
     }
 
 
+def build_partition_sweep(
+    world: Dict,
+    n_clusters: int,
+    partition_seed: int,
+    partition_names: List[str],
+    corruption_levels: List[float],
+) -> Dict[str, Dict]:
+    """Build fixed estimation partitions and their quality metadata per world."""
+    valid = {"matched", "wfss", "kmeans", "corrupt"}
+    unknown = set(partition_names) - valid
+    if unknown:
+        raise ValueError(f"unknown partition names: {sorted(unknown)}")
+    if any(level < 0.0 or level > 1.0 for level in corruption_levels):
+        raise ValueError("--corruption-levels values must lie in [0, 1]")
+
+    matched = world["cluster_indices"].copy()
+    output = {}
+    for name in partition_names:
+        if name == "matched":
+            output["matched"] = {"labels": matched, "corruption_level": 0.0}
+        elif name == "wfss":
+            output["wfss"] = {
+                "labels": compute_clusters(
+                    world["action_context_one_hot"],
+                    n_clusters=n_clusters,
+                    method="original",
+                    balance="natural",
+                    random_state=partition_seed,
+                    temperature=10.0,
+                ),
+                "corruption_level": np.nan,
+            }
+        elif name == "kmeans":
+            output["kmeans"] = {
+                "labels": compute_clusters(
+                    world["action_context_one_hot"],
+                    n_clusters=n_clusters,
+                    method="kmeans",
+                    balance="natural",
+                    random_state=partition_seed,
+                ),
+                "corruption_level": np.nan,
+            }
+        else:
+            for level in corruption_levels:
+                key = f"matched_corrupt_{level:g}"
+                output[key] = {
+                    "labels": corrupt_partition(
+                        matched,
+                        p=level,
+                        random_state=partition_seed + int(round(level * 1_000_000)),
+                    ),
+                    "corruption_level": float(level),
+                }
+    for item in output.values():
+        item["ari_to_matched"] = float(adjusted_rand_score(matched, item["labels"]))
+    return output
+
+
 def fit_action_reward_model(
     bandit_data: Dict,
     random_state: int,
+    prediction_context: np.ndarray = None,
 ) -> np.ndarray:
     reg_model = RegressionModel(
         n_actions=bandit_data["n_actions"],
@@ -265,11 +427,18 @@ def fit_action_reward_model(
             random_state=random_state,
         ),
     )
-    return reg_model.fit_predict(
+    if prediction_context is None:
+        return reg_model.fit_predict(
+            context=bandit_data["context"],
+            action=bandit_data["action"],
+            reward=bandit_data["reward"],
+        )
+    reg_model.fit(
         context=bandit_data["context"],
         action=bandit_data["action"],
         reward=bandit_data["reward"],
     )
+    return reg_model.predict(context=prediction_context)
 
 
 def estimate_dr_dm(
@@ -321,102 +490,284 @@ def estimate_offcem(
     return float(values[estimator_name])
 
 
-def run_seed(
-    seed_index: int,
+def _set_model_seed(model_seed: int) -> None:
+    np.random.seed(model_seed)
+    torch.manual_seed(model_seed)
+
+
+def _local_correctness_diagnostics(
+    world: Dict,
+    f_population: np.ndarray,
+    labels: np.ndarray,
+) -> Dict[str, float]:
+    q = world["fixed_expected_rewards"]
+    f = f_population[:, :, 0]
+    pi0 = world["pi_b_population"][:, :, 0]
+    error = f - q
+    demeaned = np.zeros_like(error)
+    for cluster in np.unique(labels):
+        mask = labels == cluster
+        pi0_cond = pi0[:, mask] / pi0[:, mask].sum(axis=1, keepdims=True)
+        center = (pi0_cond * error[:, mask]).sum(axis=1, keepdims=True)
+        demeaned[:, mask] = error[:, mask] - center
+    cluster_sizes = np.bincount(labels)
+    return {
+        "reward_mse": float(np.mean(error**2)),
+        "lc_error": float(np.mean(demeaned**2)),
+        "ari_to_matched": float(adjusted_rand_score(world["cluster_indices"], labels)),
+        "cluster_size_min": int(cluster_sizes.min()),
+        "cluster_size_max": int(cluster_sizes.max()),
+        "cluster_size_std": float(cluster_sizes.std()),
+    }
+
+
+def _coverage_diagnostics(
+    prefix: Dict,
+    world: Dict,
+    labels: np.ndarray,
+) -> Dict[str, float]:
+    n_users = int(world["n_users"])
+    n_actions = int(world["n_actions"])
+    pairs = np.unique(
+        np.column_stack((prefix["user_idx"], prefix["action"])), axis=0
+    )
+    best_actions = world["fixed_expected_rewards"].argmax(axis=1)
+    best_seen = prefix["obs_mat"][np.arange(n_users), best_actions] > 0
+    target_mass_observed = np.sum(
+        world["pi_e_population"][:, :, 0] * prefix["obs_mat"], axis=1
+    ).mean()
+    observed_cluster_cells = np.unique(
+        np.column_stack((prefix["user_idx"], labels[prefix["action"]])), axis=0
+    ).shape[0]
+    action_counts = np.bincount(prefix["action"], minlength=n_actions)
+    pairwise_examples = 0
+    for user in range(n_users):
+        observed_actions = np.flatnonzero(prefix["obs_mat"][user])
+        if observed_actions.size == 0:
+            continue
+        counts = np.bincount(labels[observed_actions], minlength=int(labels.max()) + 1)
+        pairwise_examples += int(np.sum(counts * (counts - 1)))
+
+    pi0 = world["pi_b_population"][:, :, 0]
+    pi_e = world["pi_e_population"][:, :, 0]
+    cluster_weights = np.zeros((n_users, int(labels.max()) + 1))
+    for cluster in range(cluster_weights.shape[1]):
+        mask = labels == cluster
+        cluster_weights[:, cluster] = (
+            pi_e[:, mask].sum(axis=1) / np.maximum(pi0[:, mask].sum(axis=1), 1e-12)
+        )
+    logged_weights = cluster_weights[
+        prefix["user_idx"], labels[prefix["action"]]
+    ]
+    weight_sum_sq = float(np.sum(logged_weights**2))
+    cluster_ess = (
+        float(np.sum(logged_weights) ** 2 / weight_sum_sq)
+        if weight_sum_sq > 0
+        else 0.0
+    )
+    return {
+        "unique_users": int(np.unique(prefix["user_idx"]).size),
+        "unique_actions": int(np.count_nonzero(action_counts)),
+        "unique_user_action_pairs": int(pairs.shape[0]),
+        "user_action_coverage": float(pairs.shape[0] / (n_users * n_actions)),
+        "target_best_action_observation_rate": float(best_seen.mean()),
+        "target_mass_on_observed_actions": float(target_mass_observed),
+        "observed_user_cluster_cells": int(observed_cluster_cells),
+        "pairwise_training_examples": int(pairwise_examples),
+        "cluster_ess": cluster_ess,
+        "cluster_ess_fraction": float(cluster_ess / prefix["n_rounds"]),
+        "cluster_weight_max": float(logged_weights.max()),
+        "cluster_weight_variance": float(logged_weights.var()),
+    }
+
+
+def _append_estimates(
+    rows: List[Dict],
+    arm: str,
+    prefix: Dict,
+    world: Dict,
+    stream_index: int,
+    model_seed: int,
+    partition_sweep: Dict[str, Dict],
+    q_population: np.ndarray,
+    f_populations: Dict[str, np.ndarray],
+    diagnostics: Dict[str, Dict],
+) -> None:
+    n = int(prefix["n_rounds"])
+    pi_e_logged = world["pi_e_population"][prefix["user_idx"]]
+    q_logged = q_population[prefix["user_idx"]]
+    base_estimates = estimate_dr_dm(prefix, pi_e_logged, q_logged)
+    base_metadata = dict(
+        world_seed=int(world["world_seed"]),
+        stream_seed=int(prefix["stream_seed"]),
+        stream_index=int(stream_index),
+        model_seed=int(model_seed),
+        arm=arm,
+        partition="baseline",
+        corruption_level=np.nan,
+    )
+    for estimator in ("DR", "DM"):
+        rows.append(
+            _result_row(
+                n=n,
+                seed_index=int(world["world_seed"]),
+                estimator=estimator,
+                estimate=float(base_estimates[estimator]),
+                true_value=float(world["true_value"]),
+                **base_metadata,
+            )
+        )
+
+    for partition, item in partition_sweep.items():
+        labels = item["labels"]
+        clusters_3d = clusters_to_onehot_3d(labels, int(world["n_users"]))
+        estimate = estimate_offcem(
+            bandit_data=prefix,
+            pi_e_logged=pi_e_logged,
+            clusters_3d=clusters_3d,
+            f_x_a=f_populations[partition][prefix["user_idx"]],
+            estimator_name=f"OffCEM {partition}",
+        )
+        metadata = dict(base_metadata)
+        metadata.update(
+            partition=partition,
+            corruption_level=item["corruption_level"],
+            **diagnostics[partition],
+            **_coverage_diagnostics(prefix, world, labels),
+        )
+        rows.append(
+            _result_row(
+                n=n,
+                seed_index=int(world["world_seed"]),
+                estimator=f"OffCEM {partition}",
+                estimate=estimate,
+                true_value=float(world["true_value"]),
+                **metadata,
+            )
+        )
+
+
+def run_world(
+    world_index: int,
     n_list: List[int],
     n_clusters: int,
     eps: float,
     reward_std: float,
+    n_streams: int,
+    partition_names: List[str],
+    corruption_levels: List[float],
+    arms: List[str],
+    nuisance_train_rounds: int,
+    base_model_seed: int,
 ) -> List[Dict]:
-    seed = DEFAULTS["RANDOM_STATE"] + seed_index
-    dataset = make_dataset(seed=seed, reward_std=reward_std)
-    full_data = dataset.obtain_batch_bandit_feedback(
-        n_rounds=max(n_list),
-        n_users=DEFAULTS["N_USERS"],
+    world_seed = DEFAULTS["RANDOM_STATE"] + world_index
+    world = generate_world(world_seed, n_clusters, eps, reward_std)
+    partition_sweep = build_partition_sweep(
+        world,
         n_clusters=n_clusters,
-        clustering_method="original",
-        cluster_balance="natural",
-        cluster_temperature=10.0,
+        partition_seed=world_seed + DEFAULTS["ESTIMATION_SEED_OFFSET"],
+        partition_names=partition_names,
+        corruption_levels=corruption_levels,
     )
-    true_value, pi_e_population = population_policy_value(
-        full_data["fixed_expected_rewards"],
-        eps=eps,
-    )
-    partitions = build_fixed_estimation_partitions(
-        full_bandit_data=full_data,
-        n_clusters=n_clusters,
-        seed=seed,
-    )
-    _assert_fixed_world(full_data, true_value, partitions)
-
+    model_seed = int(base_model_seed + world_index)
     rows = []
-    previous_prefixes = {}
-    cluster_tensors = {
-        name: clusters_to_onehot_3d(labels, full_data["n_users"])
-        for name, labels in partitions.items()
-    }
-    for n in n_list:
-        prefix = build_feedback_prefix(full_data, n)
-        _assert_world_unchanged(prefix, full_data, true_value, eps)
-        _assert_nested_prefix(prefix, previous_prefixes)
-        previous_prefixes[n] = prefix
 
-        pi_e_logged = pi_e_population[prefix["user_idx"]]
-        model_seed = seed + n
-        np.random.seed(model_seed)
-        torch.manual_seed(model_seed)
-        q_x_a = fit_action_reward_model(prefix, random_state=model_seed)
-        base_estimates = estimate_dr_dm(prefix, pi_e_logged, q_x_a)
-        for estimator in ("DR", "DM"):
-            rows.append(
-                _result_row(
-                    n=n,
-                    seed_index=seed_index,
-                    estimator=estimator,
-                    estimate=float(base_estimates[estimator]),
-                    true_value=true_value,
-                )
-            )
-
-        for method in ("matched", "reestimated_wfss", "kmeans"):
-            np.random.seed(model_seed)
-            torch.manual_seed(model_seed)
-            f_x_a = train_reward_model_via_two_stage(
-                bandit_data=prefix,
-                clusters=cluster_tensors[method],
+    frozen_models = None
+    if "frozen" in arms:
+        nuisance_stream = sample_logged_stream(
+            world,
+            n_rounds=nuisance_train_rounds,
+            stream_seed=world_seed + DEFAULTS["NUISANCE_STREAM_SEED_OFFSET"],
+            reward_std=reward_std,
+        )
+        _set_model_seed(model_seed)
+        frozen_q = fit_action_reward_model(
+            nuisance_stream,
+            random_state=model_seed,
+            prediction_context=world["fixed_user_contexts"],
+        )
+        frozen_f = {}
+        frozen_diagnostics = {}
+        for partition, item in partition_sweep.items():
+            _set_model_seed(model_seed)
+            clusters_3d = clusters_to_onehot_3d(item["labels"], int(world["n_users"]))
+            frozen_f[partition] = train_reward_model_via_two_stage(
+                bandit_data=nuisance_stream,
+                clusters=clusters_3d,
                 need_q_x_a=False,
                 random_state=model_seed,
+                prediction_context=world["fixed_user_contexts"],
             )
-            estimator_name = ESTIMATOR_LABELS[method]
-            estimate = estimate_offcem(
-                bandit_data=prefix,
-                pi_e_logged=pi_e_logged,
-                clusters_3d=cluster_tensors[method],
-                f_x_a=f_x_a,
-                estimator_name=estimator_name,
+            frozen_diagnostics[partition] = _local_correctness_diagnostics(
+                world, frozen_f[partition], item["labels"]
             )
-            rows.append(
-                _result_row(
-                    n=n,
-                    seed_index=seed_index,
-                    estimator=estimator_name,
-                    estimate=estimate,
-                    true_value=true_value,
+        frozen_models = (frozen_q, frozen_f, frozen_diagnostics)
+
+    for stream_index in range(n_streams):
+        full_stream = sample_logged_stream(
+            world,
+            n_rounds=max(n_list),
+            stream_seed=world_seed + DEFAULTS["STREAM_SEED_OFFSET"] + stream_index,
+            reward_std=reward_std,
+        )
+        previous_prefixes = {}
+        for n in n_list:
+            prefix = build_feedback_prefix(full_stream, n)
+            _assert_world_unchanged(prefix, world, world["true_value"], eps)
+            _assert_nested_prefix(prefix, previous_prefixes)
+            previous_prefixes[n] = prefix
+
+            if "end_to_end" in arms:
+                _set_model_seed(model_seed)
+                q_population = fit_action_reward_model(
+                    prefix,
+                    random_state=model_seed,
+                    prediction_context=world["fixed_user_contexts"],
                 )
-            )
+                f_populations = {}
+                diagnostics = {}
+                for partition, item in partition_sweep.items():
+                    _set_model_seed(model_seed)
+                    clusters_3d = clusters_to_onehot_3d(
+                        item["labels"], int(world["n_users"])
+                    )
+                    f_populations[partition] = train_reward_model_via_two_stage(
+                        bandit_data=prefix,
+                        clusters=clusters_3d,
+                        need_q_x_a=False,
+                        random_state=model_seed,
+                        prediction_context=world["fixed_user_contexts"],
+                    )
+                    diagnostics[partition] = _local_correctness_diagnostics(
+                        world, f_populations[partition], item["labels"]
+                    )
+                _append_estimates(
+                    rows, "end_to_end", prefix, world, stream_index, model_seed,
+                    partition_sweep, q_population, f_populations, diagnostics,
+                )
+
+            if frozen_models is not None:
+                frozen_q, frozen_f, frozen_diagnostics = frozen_models
+                _append_estimates(
+                    rows, "frozen", prefix, world, stream_index, model_seed,
+                    partition_sweep, frozen_q, frozen_f, frozen_diagnostics,
+                )
     return rows
 
 
-def _result_row(n, seed_index, estimator, estimate, true_value):
+def _result_row(n, seed_index, estimator, estimate, true_value, **metadata):
     error = float(estimate - true_value)
-    return {
+    row = {
         "n": int(n),
         "seed": int(seed_index),
         "estimator": estimator,
         "estimate": float(estimate),
         "true_value": float(true_value),
+        "error": error,
         "squared_error": float(error**2),
     }
+    row.update(metadata)
+    return row
 
 
 def _assert_fixed_world(
@@ -472,31 +823,121 @@ def _assert_nested_prefix(prefix: Dict, previous_prefixes: Dict[int, Dict]) -> N
 def aggregate_results(rows: Iterable[Dict]) -> List[Dict]:
     grouped = {}
     for row in rows:
-        grouped.setdefault((row["n"], row["estimator"]), []).append(row)
+        arm = row.get("arm", "end_to_end")
+        partition = row.get("partition")
+        if partition is None:
+            partition = "baseline" if row["estimator"] in {"DR", "DM"} else row["estimator"]
+        grouped.setdefault((arm, row["n"], partition, row["estimator"]), []).append(row)
 
     aggregates = []
-    for (n, estimator), items in sorted(grouped.items()):
+    for (arm, n, partition, estimator), items in sorted(grouped.items()):
         estimates = np.array([item["estimate"] for item in items], dtype=float)
         true_values = np.array([item["true_value"] for item in items], dtype=float)
         errors = estimates - true_values
-        mse = float(np.mean(errors**2))
-        bias2 = float(np.mean(errors) ** 2)
-        variance = float(np.mean((errors - errors.mean()) ** 2))
-        norm = float(np.mean(true_values**2))
-        aggregates.append(
-            {
-                "n": int(n),
-                "estimator": estimator,
-                "mse": mse,
-                "rel_mse": mse / max(norm, 1e-12),
-                "bias2": bias2,
-                "variance": variance,
-                "estimate_mean": float(estimates.mean()),
-                "true_value_mean": float(true_values.mean()),
-                "n_seeds": len(items),
-            }
-        )
+        by_world = {}
+        for item in items:
+            world_seed = int(item.get("world_seed", item["seed"]))
+            by_world.setdefault(world_seed, []).append(item)
+        world_bias2 = []
+        world_variances = []
+        world_mses = []
+        for world_items in by_world.values():
+            world_errors = np.array(
+                [item["estimate"] - item["true_value"] for item in world_items],
+                dtype=float,
+            )
+            world_bias2.append(float(world_errors.mean() ** 2))
+            world_variances.append(float(np.mean((world_errors - world_errors.mean()) ** 2)))
+            world_mses.append(float(np.mean(world_errors**2)))
+
+        aggregate = {
+            "arm": arm,
+            "n": int(n),
+            "partition": partition,
+            "estimator": estimator,
+            "mse": float(np.mean(errors**2)),
+            "rel_mse": float(np.mean((errors**2) / np.maximum(true_values**2, 1e-12))),
+            "bias2": float(np.mean(world_bias2)),
+            "variance": float(np.mean(world_variances)),
+            "between_world_error_variance": float(np.var([np.mean([
+                item["estimate"] - item["true_value"] for item in world_items
+            ]) for world_items in by_world.values()])),
+            "estimate_mean": float(estimates.mean()),
+            "true_value_mean": float(true_values.mean()),
+            "n_worlds": len(by_world),
+            "n_stream_rows": len(items),
+        }
+        numeric_keys = set().union(*(item.keys() for item in items))
+        excluded = {
+            "n", "seed", "world_seed", "stream_seed", "stream_index", "model_seed",
+            "arm", "partition", "estimator", "corruption_level", "estimate",
+            "true_value", "error", "squared_error",
+        }
+        for key in sorted(numeric_keys - excluded):
+            values = [item.get(key, np.nan) for item in items]
+            try:
+                values = np.asarray(values, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(values).any():
+                aggregate[f"{key}_mean"] = float(np.nanmean(values))
+        corruption_values = [item.get("corruption_level", np.nan) for item in items]
+        if np.isfinite(np.asarray(corruption_values, dtype=float)).any():
+            aggregate["corruption_level"] = float(np.nanmean(corruption_values))
+        aggregates.append(aggregate)
     return aggregates
+
+
+def _metric_from_items(items: List[Dict], key: str) -> float:
+    estimates = np.array([item["estimate"] for item in items], dtype=float)
+    true_values = np.array([item["true_value"] for item in items], dtype=float)
+    errors = estimates - true_values
+    if key == "mse":
+        return float(np.mean(errors**2))
+    if key == "rel_mse":
+        norm = float(np.mean(true_values**2))
+        return float(np.mean(errors**2) / max(norm, 1e-12))
+    if key == "bias2":
+        return float(np.mean(errors) ** 2)
+    if key == "variance":
+        return float(np.mean((errors - errors.mean()) ** 2))
+    raise ValueError(f"unsupported metric for error bars: {key}")
+
+
+def bootstrap_metric_se(
+    items: List[Dict],
+    key: str,
+    n_bootstrap: int = 1000,
+    random_state: int = 12345,
+) -> float:
+    if len(items) <= 1:
+        return 0.0
+    rng = np.random.RandomState(random_state)
+    bootstrap_values = []
+    n_items = len(items)
+    for _ in range(n_bootstrap):
+        sample_idx = rng.randint(0, n_items, size=n_items)
+        sample = [items[i] for i in sample_idx]
+        bootstrap_values.append(_metric_from_items(sample, key))
+    return float(np.std(bootstrap_values, ddof=1))
+
+
+def plot_errorbars_by_group(rows: Iterable[Dict]) -> Dict[tuple, Dict[str, float]]:
+    grouped = {}
+    for row in rows:
+        grouped.setdefault((row["n"], row["estimator"]), []).append(row)
+    errorbars = {}
+    for key, items in grouped.items():
+        seed = int(key[0]) + sum(ord(ch) for ch in key[1])
+        errorbars[key] = {
+            metric: bootstrap_metric_se(
+                items,
+                metric,
+                random_state=seed,
+            )
+            for metric in ("rel_mse", "bias2", "variance")
+        }
+    return errorbars
 
 
 def write_csv(path: Path, rows: List[Dict]) -> None:
@@ -505,8 +946,9 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         raise ValueError(f"no rows to write to {path}")
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with open(path, "w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -515,20 +957,31 @@ def load_tidy_csv(path: Path) -> List[Dict]:
     import csv
 
     with open(path) as file:
-        return [
-            {
-                "n": int(row["n"]),
-                "seed": int(row["seed"]),
-                "estimator": row["estimator"],
-                "estimate": float(row["estimate"]),
-                "true_value": float(row["true_value"]),
-                "squared_error": float(row["squared_error"]),
-            }
-            for row in csv.DictReader(file)
-        ]
+        rows = []
+        for raw in csv.DictReader(file):
+            row = {}
+            for key, value in raw.items():
+                if value == "":
+                    row[key] = np.nan
+                elif key in {"n", "seed", "world_seed", "stream_seed", "stream_index", "model_seed"}:
+                    row[key] = int(value)
+                elif key in {"estimator", "arm", "partition"}:
+                    row[key] = value
+                else:
+                    try:
+                        row[key] = float(value)
+                    except ValueError:
+                        row[key] = value
+            row.setdefault("error", row["estimate"] - row["true_value"])
+            rows.append(row)
+        return rows
 
 
-def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
+def plot_aggregates(
+    aggregates: List[Dict],
+    out_dir: Path,
+    raw_rows: List[Dict] = None,
+) -> None:
     metrics = [
         ("rel_mse", "Relative MSE", "rel_mse_vs_n.png"),
         ("bias2", "Bias^2", "bias2_vs_n.png"),
@@ -548,39 +1001,88 @@ def plot_aggregates(aggregates: List[Dict], out_dir: Path) -> None:
         "DR": "#d62728",
         "DM": "#9467bd",
     }
-    for key, ylabel, filename in metrics:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for estimator in estimators:
-            selected = [
-                row for row in aggregates if row["estimator"] == estimator
-            ]
-            if not selected:
-                continue
-            selected = sorted(selected, key=lambda row: row["n"])
-            ax.plot(
-                [row["n"] for row in selected],
-                [row[key] for row in selected],
-                marker="o",
-                linewidth=1.4,
-                markersize=4,
-                label=estimator,
-                color=colors.get(estimator),
+    arms = sorted({row.get("arm", "end_to_end") for row in aggregates})
+    for arm in arms:
+        arm_aggregates = [
+            row for row in aggregates if row.get("arm", "end_to_end") == arm
+        ]
+        arm_rows = (
+            [row for row in raw_rows if row.get("arm", "end_to_end") == arm]
+            if raw_rows is not None
+            else None
+        )
+        errorbars = plot_errorbars_by_group(arm_rows) if arm_rows is not None else {}
+        arm_estimators = sorted({row["estimator"] for row in arm_aggregates})
+        for key, ylabel, filename in metrics:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for index, estimator in enumerate(arm_estimators):
+                selected = [
+                    row for row in arm_aggregates if row["estimator"] == estimator
+                ]
+                selected = sorted(selected, key=lambda row: row["n"])
+                x = [row["n"] for row in selected]
+                y = [row[key] for row in selected]
+                yerr = [
+                    errorbars.get((row["n"], estimator), {}).get(key, 0.0)
+                    for row in selected
+                ]
+                ax.errorbar(
+                    x,
+                    y,
+                    yerr=yerr if arm_rows is not None else None,
+                    marker="o",
+                    linewidth=1.4,
+                    markersize=4,
+                    capsize=3,
+                    elinewidth=1.0,
+                    label=estimator,
+                    color=colors.get(estimator, plt.cm.tab20(index)),
+                )
+            ax.set_xscale("log")
+            ax.set_xlabel("logged interactions n")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3, which="both")
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            target = out_dir / (filename if len(arms) == 1 else f"{arm}_{filename}")
+            fig.savefig(target, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        lc_rows = [
+            row for row in arm_aggregates if "lc_error_mean" in row and np.isfinite(row["lc_error_mean"])
+        ]
+        if lc_rows:
+            fig, ax = plt.subplots(figsize=(7, 5))
+            for n in sorted({row["n"] for row in lc_rows}):
+                selected = [row for row in lc_rows if row["n"] == n]
+                ax.scatter(
+                    [row["lc_error_mean"] for row in selected],
+                    [row["rel_mse"] for row in selected],
+                    label=f"n={n}",
+                )
+            ax.set_xlabel("pi0-demeaned local-correctness error")
+            ax.set_ylabel("Relative MSE")
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            target = out_dir / (
+                "rel_mse_vs_lc_error.png"
+                if len(arms) == 1
+                else f"{arm}_rel_mse_vs_lc_error.png"
             )
-        ax.set_xscale("log")
-        ax.set_xlabel("logged interactions n")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3, which="both")
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        fig.savefig(out_dir / filename, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+            fig.savefig(target, dpi=150, bbox_inches="tight")
+            plt.close(fig)
 
 
 def run_experiment(args) -> None:
     if args.quick:
         args.n_list = "500,3000"
-        args.n_seeds = 2
-        print("[quick] n-list=500,3000 n-seeds=2")
+        args.n_worlds = 2
+        args.n_streams = 2
+        args.partitions = "matched,corrupt"
+        args.corruption_levels = "0,0.5"
+        args.arms = "end_to_end"
+        print("[quick] n-list=500,3000 n-worlds=2 n-streams=2")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -592,20 +1094,36 @@ def run_experiment(args) -> None:
         aggregates = aggregate_results(rows)
         write_csv(aggregate_path, aggregates)
         if not args.no_plot:
-            plot_aggregates(aggregates, out_dir)
+            plot_aggregates(aggregates, out_dir, raw_rows=rows)
         return
 
     n_list = parse_n_list(args.n_list)
+    n_worlds = args.n_seeds if args.n_worlds is None else args.n_worlds
+    if n_worlds <= 0 or args.n_streams <= 0:
+        raise ValueError("--n-worlds and --n-streams must be positive")
+    partition_names = parse_name_list(args.partitions, "partitions")
+    corruption_levels = parse_float_list(args.corruption_levels, "corruption-levels")
+    arms = parse_name_list(args.arms, "arms")
+    if set(arms) - {"end_to_end", "frozen"}:
+        raise ValueError("--arms supports only end_to_end,frozen")
+    if args.nuisance_train_rounds <= 0:
+        raise ValueError("--nuisance-train-rounds must be positive")
     all_rows = []
     started = time()
-    for seed_index in tqdm(range(args.n_seeds), desc="sample-size seeds"):
+    for world_index in tqdm(range(n_worlds), desc="sample-size worlds"):
         all_rows.extend(
-            run_seed(
-                seed_index=seed_index,
+            run_world(
+                world_index=world_index,
                 n_list=n_list,
                 n_clusters=args.n_clusters,
                 eps=args.eps,
                 reward_std=args.reward_std,
+                n_streams=args.n_streams,
+                partition_names=partition_names,
+                corruption_levels=corruption_levels,
+                arms=arms,
+                nuisance_train_rounds=args.nuisance_train_rounds,
+                base_model_seed=args.base_model_seed,
             )
         )
         with open(out_dir / "latest_rows.json", "w") as file:
@@ -615,7 +1133,7 @@ def run_experiment(args) -> None:
     write_csv(tidy_path, all_rows)
     write_csv(aggregate_path, aggregates)
     if not args.no_plot:
-        plot_aggregates(aggregates, out_dir)
+        plot_aggregates(aggregates, out_dir, raw_rows=all_rows)
     elapsed = (time() - started) / 60
     print(f"wrote {tidy_path}")
     print(f"wrote {aggregate_path}")
