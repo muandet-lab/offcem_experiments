@@ -21,6 +21,7 @@ from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ExponentialLR
+from tqdm import tqdm
 
 
 class PairWiseRegression(nn.Module):
@@ -152,6 +153,7 @@ def train_pairwise_model(
     weight_decay: float = 1e-4,
     random_state: int = 12345,
     verbose: bool = False,
+    progress_desc: Optional[str] = None,
 ) -> None:
     pairwise_dataset = make_pairwise_data(bandit_data, cluster_idx_mat, n_clusters)
     data_loader = torch.utils.data.DataLoader(
@@ -168,7 +170,16 @@ def train_pairwise_model(
     scheduler = ExponentialLR(optimizer, gamma=gamma)
     model.train()
     loss_list = []
-    for _ in range(num_epochs):
+    epoch_iterator = range(num_epochs)
+    if progress_desc is not None:
+        epoch_iterator = tqdm(
+            epoch_iterator,
+            desc=progress_desc,
+            total=num_epochs,
+            leave=False,
+            position=1,
+        )
+    for _ in epoch_iterator:
         losses = []
         for x, c, a1, a2, e1, e2, r1, r2 in data_loader:
             loss = model(x, a1, a2, r1, r2)
@@ -194,6 +205,7 @@ def train_reward_model_via_two_stage(
     need_q_x_a: bool = True,
     random_state: int = 12345,
     prediction_context: Optional[np.ndarray] = None,
+    progress_desc: Optional[str] = None,
 ) -> np.ndarray:
 
     ### two-step reward regression for the proposed estimator ###
@@ -217,6 +229,7 @@ def train_reward_model_via_two_stage(
         cluster_idx_mat,
         n_clusters,
         prediction_context=prediction_context,
+        progress_desc=progress_desc,
     )
     reward_residual = bandit_data["reward"].astype(float)
     train_prediction_idx = (

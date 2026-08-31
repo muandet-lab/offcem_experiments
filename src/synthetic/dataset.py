@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 import enum
+from typing import Callable
+from typing import Optional
 
 import numpy as np
 from clustering import compute_clusters
@@ -148,6 +150,8 @@ class SyntheticBanditDataset(SyntheticBanditDatasetWithActionEmbeds):
         n_rounds: int,
         stream_seed: int,
         materialize_round_policy: bool = True,
+        action_sample_chunk_size: Optional[int] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> BanditFeedback:
         """Sample a logged stream from a fixed synthetic world."""
         check_scalar(n_rounds, "n_rounds", int, min_val=1)
@@ -161,9 +165,22 @@ class SyntheticBanditDataset(SyntheticBanditDatasetWithActionEmbeds):
         user_idx = user_rng.choice(int(world["n_users"]), size=n_rounds)
         context = world["fixed_user_contexts"][user_idx]
         pi_b_population = world["pi_b_population"][:, :, 0]
-        action = sample_action_fast(
-            pi_b_population[user_idx], random_state=action_seed
-        )
+        if action_sample_chunk_size is None:
+            action = sample_action_fast(
+                pi_b_population[user_idx], random_state=action_seed
+            )
+            if progress_callback is not None:
+                progress_callback(n_rounds)
+        else:
+            action = np.empty(n_rounds, dtype=int)
+            action_rng = check_random_state(action_seed)
+            for start in range(0, n_rounds, action_sample_chunk_size):
+                stop = min(start + action_sample_chunk_size, n_rounds)
+                probabilities = pi_b_population[user_idx[start:stop]]
+                uniform_rvs = action_rng.uniform(size=stop - start)[:, np.newaxis]
+                action[start:stop] = (probabilities.cumsum(axis=1) > uniform_rvs).argmax(axis=1)
+                if progress_callback is not None:
+                    progress_callback(stop - start)
         expected_rewards_factual = world["fixed_expected_rewards"][user_idx, action]
         if RewardType(self.reward_type) == RewardType.BINARY:
             reward = reward_rng.binomial(n=1, p=sigmoid(expected_rewards_factual))

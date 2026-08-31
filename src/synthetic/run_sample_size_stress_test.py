@@ -16,6 +16,7 @@ from time import time
 from typing import Dict
 from typing import Iterable
 from typing import List
+from typing import Optional
 
 warnings.filterwarnings("ignore")
 
@@ -267,6 +268,8 @@ def sample_logged_stream(
     stream_seed: int,
     reward_std: float,
     compact: bool = False,
+    action_sample_chunk_size: Optional[int] = None,
+    progress_callback=None,
 ) -> Dict:
     """Sample one independent logged stream without changing the world."""
     dataset = make_dataset(seed=int(world["world_seed"]), reward_std=reward_std)
@@ -275,7 +278,44 @@ def sample_logged_stream(
         n_rounds=n_rounds,
         stream_seed=stream_seed,
         materialize_round_policy=not compact,
+        action_sample_chunk_size=action_sample_chunk_size,
+        progress_callback=progress_callback,
     )
+
+
+def sample_logged_stream_with_progress(
+    world: Dict,
+    n_rounds: int,
+    stream_seed: int,
+    reward_std: float,
+    compact: bool,
+    progress_desc: str,
+    show_progress: bool,
+) -> Dict:
+    """Sample a stream in chunks so long compact runs have a real ETA."""
+    stream_progress = None
+    if show_progress:
+        stream_progress = tqdm(
+            total=n_rounds,
+            desc=progress_desc,
+            unit="rounds",
+            unit_scale=True,
+            leave=False,
+            position=1,
+        )
+    try:
+        return sample_logged_stream(
+            world=world,
+            n_rounds=n_rounds,
+            stream_seed=stream_seed,
+            reward_std=reward_std,
+            compact=compact,
+            action_sample_chunk_size=10_000 if stream_progress is not None else None,
+            progress_callback=(stream_progress.update if stream_progress is not None else None),
+        )
+    finally:
+        if stream_progress is not None:
+            stream_progress.close()
 
 
 def build_feedback_prefix(full_bandit_data: Dict, n: int) -> Dict:
@@ -423,6 +463,17 @@ def build_partition_sweep(
     for item in output.values():
         item["ari_to_matched"] = float(adjusted_rand_score(matched, item["labels"]))
     return output
+
+
+def count_partition_variants(
+    partition_names: List[str],
+    corruption_levels: List[float],
+) -> int:
+    """Return the number of fixed partitions implied by CLI selections."""
+    return sum(
+        len(corruption_levels) if name == "corrupt" else 1
+        for name in partition_names
+    )
 
 
 def fit_action_reward_model(
@@ -754,23 +805,40 @@ def run_world(
             progress.set_postfix_str(
                 f"world={world_index + 1} training frozen nuisance models"
             )
-        nuisance_stream = sample_logged_stream(
-            world,
+        nuisance_stream = sample_logged_stream_with_progress(
+            world=world,
             n_rounds=nuisance_train_rounds,
             stream_seed=world_seed + DEFAULTS["NUISANCE_STREAM_SEED_OFFSET"],
             reward_std=reward_std,
             compact=True,
+            progress_desc=f"w{world_index + 1} frozen nuisance stream",
+            show_progress=progress is not None,
         )
         _set_model_seed(model_seed)
+        if progress is not None:
+            progress.set_postfix_str(
+                f"world={world_index + 1} frozen nuisance: action reward model"
+            )
         frozen_q = fit_action_reward_model(
             nuisance_stream,
             random_state=model_seed,
             prediction_context=world["fixed_user_contexts"],
         )
+        if progress is not None:
+            progress.update(1)
         frozen_f = {}
         frozen_diagnostics = {}
         for partition, item in partition_sweep.items():
             _set_model_seed(model_seed)
+            progress_desc = (
+                f"w{world_index + 1} frozen {partition} pairwise"
+                if progress is not None
+                else None
+            )
+            if progress is not None:
+                progress.set_postfix_str(
+                    f"world={world_index + 1} frozen nuisance: OffCEM {partition}"
+                )
             clusters_3d = clusters_to_onehot_3d(item["labels"], int(world["n_users"]))
             frozen_f[partition] = train_reward_model_via_two_stage(
                 bandit_data=nuisance_stream,
@@ -778,19 +846,30 @@ def run_world(
                 need_q_x_a=False,
                 random_state=model_seed,
                 prediction_context=world["fixed_user_contexts"],
+                progress_desc=progress_desc,
             )
             frozen_diagnostics[partition] = _local_correctness_diagnostics(
                 world, frozen_f[partition], item["labels"]
             )
+            if progress is not None:
+                progress.update(1)
         frozen_models = (frozen_q, frozen_f, frozen_diagnostics)
 
     for stream_index in range(n_streams):
-        full_stream = sample_logged_stream(
-            world,
+        if progress is not None:
+            progress.set_postfix_str(
+                f"world={world_index + 1} stream={stream_index + 1}/{n_streams} sampling {max(n_list)} rounds"
+            )
+        full_stream = sample_logged_stream_with_progress(
+            world=world,
             n_rounds=max(n_list),
             stream_seed=world_seed + DEFAULTS["STREAM_SEED_OFFSET"] + stream_index,
             reward_std=reward_std,
             compact=compact_evaluation,
+            progress_desc=(
+                f"w{world_index + 1} stream {stream_index + 1}/{n_streams} logging"
+            ),
+            show_progress=progress is not None,
         )
         previous_prefixes = {}
         for n in n_list:
@@ -801,15 +880,30 @@ def run_world(
 
             if "end_to_end" in arms:
                 _set_model_seed(model_seed)
+                if progress is not None:
+                    progress.set_postfix_str(
+                        f"world={world_index + 1} stream={stream_index + 1}/{n_streams} n={n}: action reward model"
+                    )
                 q_population = fit_action_reward_model(
                     prefix,
                     random_state=model_seed,
                     prediction_context=world["fixed_user_contexts"],
                 )
+                if progress is not None:
+                    progress.update(1)
                 f_populations = {}
                 diagnostics = {}
                 for partition, item in partition_sweep.items():
                     _set_model_seed(model_seed)
+                    progress_desc = (
+                        f"w{world_index + 1} s{stream_index + 1} n{n} {partition} pairwise"
+                        if progress is not None
+                        else None
+                    )
+                    if progress is not None:
+                        progress.set_postfix_str(
+                            f"world={world_index + 1} stream={stream_index + 1}/{n_streams} n={n}: OffCEM {partition}"
+                        )
                     clusters_3d = clusters_to_onehot_3d(
                         item["labels"], int(world["n_users"])
                     )
@@ -819,10 +913,13 @@ def run_world(
                         need_q_x_a=False,
                         random_state=model_seed,
                         prediction_context=world["fixed_user_contexts"],
+                        progress_desc=progress_desc,
                     )
                     diagnostics[partition] = _local_correctness_diagnostics(
                         world, f_populations[partition], item["labels"]
                     )
+                    if progress is not None:
+                        progress.update(1)
                 _append_estimates(
                     rows, "end_to_end", prefix, world, stream_index, model_seed,
                     partition_sweep, q_population, f_populations, diagnostics,
@@ -836,11 +933,8 @@ def run_world(
                     partition_sweep, frozen_q, frozen_f, frozen_diagnostics,
                     compact_evaluation,
                 )
-            if progress is not None:
-                progress.update(1)
-                progress.set_postfix_str(
-                    f"world={world_index + 1} stream={stream_index + 1}/{n_streams} n={n}"
-                )
+                if progress is not None:
+                    progress.update(1)
     return rows
 
 
@@ -1204,8 +1298,14 @@ def run_experiment(args) -> None:
         )
     all_rows = []
     started = time()
-    total_prefixes = n_worlds * args.n_streams * len(n_list)
-    progress = tqdm(total=total_prefixes, desc="sample-size stream prefixes")
+    n_partitions = count_partition_variants(partition_names, corruption_levels)
+    total_tasks = 0
+    if "end_to_end" in arms:
+        total_tasks += n_worlds * args.n_streams * len(n_list) * (1 + n_partitions)
+    if "frozen" in arms:
+        total_tasks += n_worlds * (1 + n_partitions)
+        total_tasks += n_worlds * args.n_streams * len(n_list)
+    progress = tqdm(total=total_tasks, desc="sample-size model tasks")
     for world_index in range(n_worlds):
         progress.set_postfix_str(f"world={world_index + 1} initializing")
         all_rows.extend(
