@@ -152,6 +152,15 @@ def parse_args():
         help="Model RNG offset; intentionally independent of n and stream",
     )
     parser.add_argument(
+        "--compact-evaluation",
+        action="store_true",
+        help=(
+            "Avoid dense n_rounds x n_actions policy/reward tensors and use "
+            "the equivalent population-indexed DR/DM/OffCEM score formulas. "
+            "Required for practical million-round runs."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         type=str,
         default="/Users/cispa/Documents/OffCEM/sample_size_stress_results",
@@ -257,6 +266,7 @@ def sample_logged_stream(
     n_rounds: int,
     stream_seed: int,
     reward_std: float,
+    compact: bool = False,
 ) -> Dict:
     """Sample one independent logged stream without changing the world."""
     dataset = make_dataset(seed=int(world["world_seed"]), reward_std=reward_std)
@@ -264,6 +274,7 @@ def sample_logged_stream(
         world=world,
         n_rounds=n_rounds,
         stream_seed=stream_seed,
+        materialize_round_policy=not compact,
     )
 
 
@@ -462,6 +473,25 @@ def estimate_dr_dm(
     )
 
 
+def estimate_dr_dm_compact(
+    bandit_data: Dict,
+    world: Dict,
+    q_population: np.ndarray,
+) -> Dict[str, float]:
+    """Compute the DR/DM means without materializing round-by-action tensors."""
+    q = q_population[:, :, 0]
+    pi_e = world["pi_e_population"][:, :, 0]
+    user_idx = bandit_data["user_idx"]
+    action = bandit_data["action"]
+    dm_by_user = np.sum(pi_e * q, axis=1)
+    dm_round = dm_by_user[user_idx]
+    factual_q = q[user_idx, action]
+    factual_pi_e = pi_e[user_idx, action]
+    importance_weight = factual_pi_e / np.maximum(bandit_data["pscore"], 1e-12)
+    dr_round = dm_round + importance_weight * (bandit_data["reward"] - factual_q)
+    return {"DR": float(dr_round.mean()), "DM": float(dm_round.mean())}
+
+
 def estimate_offcem(
     bandit_data: Dict,
     pi_e_logged: np.ndarray,
@@ -488,6 +518,41 @@ def estimate_offcem(
         estimated_rewards_by_reg_model={estimator_name: f_x_a},
     )
     return float(values[estimator_name])
+
+
+def estimate_offcem_compact(
+    bandit_data: Dict,
+    world: Dict,
+    cluster_labels: np.ndarray,
+    f_population: np.ndarray,
+) -> float:
+    """Population-indexed implementation of the OffCEM sample score.
+
+    This is algebraically the clustered branch of ``OffCEM._estimate_round_rewards``
+    and avoids allocating ``(n_rounds, n_actions)`` arrays.
+    """
+    f = f_population[:, :, 0]
+    pi_b = world["pi_b_population"][:, :, 0]
+    pi_e = world["pi_e_population"][:, :, 0]
+    n_users = int(world["n_users"])
+    n_clusters = int(cluster_labels.max()) + 1
+    pi_b_cluster = np.zeros((n_users, n_clusters))
+    pi_e_cluster = np.zeros_like(pi_b_cluster)
+    for cluster in range(n_clusters):
+        mask = cluster_labels == cluster
+        pi_b_cluster[:, cluster] = pi_b[:, mask].sum(axis=1)
+        pi_e_cluster[:, cluster] = pi_e[:, mask].sum(axis=1)
+    user_idx = bandit_data["user_idx"]
+    action = bandit_data["action"]
+    observed_cluster = cluster_labels[action]
+    weights = (
+        pi_e_cluster[user_idx, observed_cluster]
+        / np.maximum(pi_b_cluster[user_idx, observed_cluster], 1e-12)
+    )
+    plugin_by_user = np.sum(pi_e * f, axis=1)
+    score = plugin_by_user[user_idx]
+    score += weights * (bandit_data["reward"] - f[user_idx, action])
+    return float(score.mean())
 
 
 def _set_model_seed(model_seed: int) -> None:
@@ -592,11 +657,15 @@ def _append_estimates(
     q_population: np.ndarray,
     f_populations: Dict[str, np.ndarray],
     diagnostics: Dict[str, Dict],
+    compact_evaluation: bool,
 ) -> None:
     n = int(prefix["n_rounds"])
-    pi_e_logged = world["pi_e_population"][prefix["user_idx"]]
-    q_logged = q_population[prefix["user_idx"]]
-    base_estimates = estimate_dr_dm(prefix, pi_e_logged, q_logged)
+    if compact_evaluation:
+        base_estimates = estimate_dr_dm_compact(prefix, world, q_population)
+    else:
+        pi_e_logged = world["pi_e_population"][prefix["user_idx"]]
+        q_logged = q_population[prefix["user_idx"]]
+        base_estimates = estimate_dr_dm(prefix, pi_e_logged, q_logged)
     base_metadata = dict(
         world_seed=int(world["world_seed"]),
         stream_seed=int(prefix["stream_seed"]),
@@ -620,14 +689,19 @@ def _append_estimates(
 
     for partition, item in partition_sweep.items():
         labels = item["labels"]
-        clusters_3d = clusters_to_onehot_3d(labels, int(world["n_users"]))
-        estimate = estimate_offcem(
-            bandit_data=prefix,
-            pi_e_logged=pi_e_logged,
-            clusters_3d=clusters_3d,
-            f_x_a=f_populations[partition][prefix["user_idx"]],
-            estimator_name=f"OffCEM {partition}",
-        )
+        if compact_evaluation:
+            estimate = estimate_offcem_compact(
+                prefix, world, labels, f_populations[partition]
+            )
+        else:
+            clusters_3d = clusters_to_onehot_3d(labels, int(world["n_users"]))
+            estimate = estimate_offcem(
+                bandit_data=prefix,
+                pi_e_logged=pi_e_logged,
+                clusters_3d=clusters_3d,
+                f_x_a=f_populations[partition][prefix["user_idx"]],
+                estimator_name=f"OffCEM {partition}",
+            )
         metadata = dict(base_metadata)
         metadata.update(
             partition=partition,
@@ -659,6 +733,7 @@ def run_world(
     arms: List[str],
     nuisance_train_rounds: int,
     base_model_seed: int,
+    compact_evaluation: bool,
     progress=None,
 ) -> List[Dict]:
     world_seed = DEFAULTS["RANDOM_STATE"] + world_index
@@ -684,6 +759,7 @@ def run_world(
             n_rounds=nuisance_train_rounds,
             stream_seed=world_seed + DEFAULTS["NUISANCE_STREAM_SEED_OFFSET"],
             reward_std=reward_std,
+            compact=True,
         )
         _set_model_seed(model_seed)
         frozen_q = fit_action_reward_model(
@@ -714,6 +790,7 @@ def run_world(
             n_rounds=max(n_list),
             stream_seed=world_seed + DEFAULTS["STREAM_SEED_OFFSET"] + stream_index,
             reward_std=reward_std,
+            compact=compact_evaluation,
         )
         previous_prefixes = {}
         for n in n_list:
@@ -749,6 +826,7 @@ def run_world(
                 _append_estimates(
                     rows, "end_to_end", prefix, world, stream_index, model_seed,
                     partition_sweep, q_population, f_populations, diagnostics,
+                    compact_evaluation,
                 )
 
             if frozen_models is not None:
@@ -756,6 +834,7 @@ def run_world(
                 _append_estimates(
                     rows, "frozen", prefix, world, stream_index, model_seed,
                     partition_sweep, frozen_q, frozen_f, frozen_diagnostics,
+                    compact_evaluation,
                 )
             if progress is not None:
                 progress.update(1)
@@ -1118,6 +1197,11 @@ def run_experiment(args) -> None:
         raise ValueError("--arms supports only end_to_end,frozen")
     if args.nuisance_train_rounds <= 0:
         raise ValueError("--nuisance-train-rounds must be positive")
+    if max(n_list) > 100000 and not args.compact_evaluation:
+        raise ValueError(
+            "sample sizes above 100000 require --compact-evaluation to avoid "
+            "dense round-by-action arrays"
+        )
     all_rows = []
     started = time()
     total_prefixes = n_worlds * args.n_streams * len(n_list)
@@ -1137,6 +1221,7 @@ def run_experiment(args) -> None:
                 arms=arms,
                 nuisance_train_rounds=args.nuisance_train_rounds,
                 base_model_seed=args.base_model_seed,
+                compact_evaluation=args.compact_evaluation,
                 progress=progress,
             )
         )

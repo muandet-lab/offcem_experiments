@@ -147,6 +147,7 @@ class SyntheticBanditDataset(SyntheticBanditDatasetWithActionEmbeds):
         world: BanditFeedback,
         n_rounds: int,
         stream_seed: int,
+        materialize_round_policy: bool = True,
     ) -> BanditFeedback:
         """Sample a logged stream from a fixed synthetic world."""
         check_scalar(n_rounds, "n_rounds", int, min_val=1)
@@ -159,10 +160,11 @@ class SyntheticBanditDataset(SyntheticBanditDatasetWithActionEmbeds):
         reward_rng = check_random_state(reward_seed)
         user_idx = user_rng.choice(int(world["n_users"]), size=n_rounds)
         context = world["fixed_user_contexts"][user_idx]
-        expected_reward = world["fixed_expected_rewards"][user_idx]
-        pi_b = world["pi_b_population"][user_idx]
-        action = sample_action_fast(pi_b[:, :, 0], random_state=action_seed)
-        expected_rewards_factual = expected_reward[np.arange(n_rounds), action]
+        pi_b_population = world["pi_b_population"][:, :, 0]
+        action = sample_action_fast(
+            pi_b_population[user_idx], random_state=action_seed
+        )
+        expected_rewards_factual = world["fixed_expected_rewards"][user_idx, action]
         if RewardType(self.reward_type) == RewardType.BINARY:
             reward = reward_rng.binomial(n=1, p=sigmoid(expected_rewards_factual))
         else:
@@ -194,11 +196,19 @@ class SyntheticBanditDataset(SyntheticBanditDatasetWithActionEmbeds):
             reward_sum_mat=reward_sum_mat,
             obs_count_mat=obs_count_mat,
             obs_mat=observed.astype(int),
-            expected_reward=expected_reward,
+            expected_reward=(
+                world["fixed_expected_rewards"][user_idx]
+                if materialize_round_policy
+                else None
+            ),
             position=None,
             action_embed=world["action_context"][action],
-            pi_b=pi_b,
-            pscore=pi_b[np.arange(n_rounds), action, 0],
+            pi_b=(
+                world["pi_b_population"][user_idx]
+                if materialize_round_policy
+                else None
+            ),
+            pscore=pi_b_population[user_idx, action],
         )
         return stream
 

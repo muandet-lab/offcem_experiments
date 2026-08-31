@@ -9,10 +9,15 @@ SYNTHETIC = Path(__file__).resolve().parents[1] / "src" / "synthetic"
 sys.path.insert(0, str(SYNTHETIC))
 
 from clustering import compute_clusters  # noqa: E402
+from clustering import clusters_to_onehot_3d  # noqa: E402
 from run_sample_size_stress_test import build_feedback_prefix  # noqa: E402
 from run_sample_size_stress_test import build_fixed_estimation_partitions  # noqa: E402
 from run_sample_size_stress_test import build_partition_sweep  # noqa: E402
 from run_sample_size_stress_test import aggregate_results  # noqa: E402
+from run_sample_size_stress_test import estimate_dr_dm  # noqa: E402
+from run_sample_size_stress_test import estimate_dr_dm_compact  # noqa: E402
+from run_sample_size_stress_test import estimate_offcem  # noqa: E402
+from run_sample_size_stress_test import estimate_offcem_compact  # noqa: E402
 from run_sample_size_stress_test import generate_world  # noqa: E402
 from run_sample_size_stress_test import plot_errorbars_by_group  # noqa: E402
 from run_sample_size_stress_test import population_policy_value  # noqa: E402
@@ -243,6 +248,49 @@ class SampleSizeStressPrefixTest(unittest.TestCase):
         self.assertAlmostEqual(aggregate["bias2"], 6.5)
         self.assertAlmostEqual(aggregate["variance"], 1.0)
         self.assertAlmostEqual(aggregate["rel_mse"], 0.075)
+
+    def test_compact_scores_match_dense_obp_scores(self):
+        world = generate_world(
+            world_seed=19,
+            n_clusters=2,
+            eps=0.2,
+            reward_std=3.0,
+        )
+        dense_stream = sample_logged_stream(
+            world, 20, stream_seed=92, reward_std=3.0
+        )
+        compact_stream = sample_logged_stream(
+            world, 20, stream_seed=92, reward_std=3.0, compact=True
+        )
+        np.testing.assert_array_equal(dense_stream["action"], compact_stream["action"])
+        np.testing.assert_array_equal(dense_stream["reward"], compact_stream["reward"])
+        self.assertIsNone(compact_stream["pi_b"])
+        self.assertIsNone(compact_stream["expected_reward"])
+
+        q_population = world["fixed_expected_rewards"][:, :, None]
+        f_population = q_population + 0.25
+        pi_e_logged = world["pi_e_population"][dense_stream["user_idx"]]
+        dense_base = estimate_dr_dm(
+            dense_stream, pi_e_logged, q_population[dense_stream["user_idx"]]
+        )
+        compact_base = estimate_dr_dm_compact(
+            compact_stream, world, q_population
+        )
+        self.assertAlmostEqual(dense_base["DR"], compact_base["DR"])
+        self.assertAlmostEqual(dense_base["DM"], compact_base["DM"])
+
+        labels = world["cluster_indices"]
+        dense_offcem = estimate_offcem(
+            dense_stream,
+            pi_e_logged,
+            clusters_to_onehot_3d(labels, int(world["n_users"])),
+            f_population[dense_stream["user_idx"]],
+            "test-offcem",
+        )
+        compact_offcem = estimate_offcem_compact(
+            compact_stream, world, labels, f_population
+        )
+        self.assertAlmostEqual(dense_offcem, compact_offcem)
 
 
 if __name__ == "__main__":
