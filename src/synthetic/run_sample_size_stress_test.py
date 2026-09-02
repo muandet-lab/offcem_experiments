@@ -1105,6 +1105,25 @@ def bootstrap_metric_se(
     return float(np.std(bootstrap_values, ddof=1))
 
 
+def bootstrap_metric_interval(
+    items: List[Dict],
+    key: str,
+    n_bootstrap: int = 2000,
+    random_state: int = 12345,
+) -> tuple:
+    """Return a percentile bootstrap interval over independent raw rows."""
+    point = _metric_from_items(items, key)
+    if len(items) <= 1:
+        return point, point, point
+    rng = np.random.RandomState(random_state)
+    sample_idx = rng.randint(0, len(items), size=(n_bootstrap, len(items)))
+    draws = np.array(
+        [_metric_from_items([items[i] for i in indices], key) for indices in sample_idx]
+    )
+    low, high = np.percentile(draws, [2.5, 97.5])
+    return point, float(low), float(high)
+
+
 def plot_errorbars_by_group(rows: Iterable[Dict]) -> Dict[tuple, Dict[str, float]]:
     grouped = {}
     for row in rows:
@@ -1164,7 +1183,9 @@ def plot_aggregates(
     aggregates: List[Dict],
     out_dir: Path,
     raw_rows: List[Dict] = None,
+    metrics_to_plot: Optional[List[tuple]] = None,
 ) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
     metrics = [
         ("rel_mse", "Relative MSE", "rel_mse_vs_n.png"),
         ("bias2", "Bias^2", "bias2_vs_n.png"),
@@ -1184,6 +1205,7 @@ def plot_aggregates(
         "DR": "#d62728",
         "DM": "#9467bd",
     }
+    metrics_to_plot = metrics if metrics_to_plot is None else metrics_to_plot
     arms = sorted({row.get("arm", "end_to_end") for row in aggregates})
     for arm in arms:
         arm_aggregates = [
@@ -1194,9 +1216,14 @@ def plot_aggregates(
             if raw_rows is not None
             else None
         )
-        errorbars = plot_errorbars_by_group(arm_rows) if arm_rows is not None else {}
-        arm_estimators = sorted({row["estimator"] for row in arm_aggregates})
-        for key, ylabel, filename in metrics:
+        available_estimators = {row["estimator"] for row in arm_aggregates}
+        arm_estimators = [
+            estimator for estimator in estimators if estimator in available_estimators
+        ]
+        arm_estimators.extend(
+            sorted(available_estimators - set(arm_estimators))
+        )
+        for key, ylabel, filename in metrics_to_plot:
             fig, ax = plt.subplots(figsize=(8, 5))
             for index, estimator in enumerate(arm_estimators):
                 selected = [
@@ -1205,27 +1232,43 @@ def plot_aggregates(
                 selected = sorted(selected, key=lambda row: row["n"])
                 x = [row["n"] for row in selected]
                 y = [row[key] for row in selected]
-                yerr = [
-                    errorbars.get((row["n"], estimator), {}).get(key, 0.0)
-                    for row in selected
-                ]
-                ax.errorbar(
+                color = colors.get(estimator, plt.cm.tab20(index))
+                ax.plot(
                     x,
                     y,
-                    yerr=yerr if arm_rows is not None else None,
                     marker="o",
                     linewidth=1.4,
                     markersize=4,
-                    capsize=3,
-                    elinewidth=1.0,
                     label=estimator,
-                    color=colors.get(estimator, plt.cm.tab20(index)),
+                    color=color,
                 )
+                if arm_rows is not None:
+                    lower, upper = [], []
+                    for n in x:
+                        items = [
+                            row for row in arm_rows
+                            if row["n"] == n and row["estimator"] == estimator
+                        ]
+                        _, low, high = bootstrap_metric_interval(
+                            items,
+                            key,
+                            random_state=int(n) + sum(map(ord, estimator)),
+                        )
+                        lower.append(low)
+                        upper.append(high)
+                    ax.fill_between(
+                        x,
+                        lower,
+                        upper,
+                        color=color,
+                        alpha=0.14,
+                        linewidth=0,
+                    )
             ax.set_xscale("log")
             ax.set_xlabel("logged interactions n")
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3, which="both")
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=7, loc="lower left")
             fig.tight_layout()
             target = out_dir / (filename if len(arms) == 1 else f"{arm}_{filename}")
             fig.savefig(target, dpi=150, bbox_inches="tight")
