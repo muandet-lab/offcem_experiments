@@ -183,6 +183,9 @@ def run_world(
         )
 
     rows = []
+    # Keep initialization and minibatch-order randomness fixed within a world.
+    # Differences between cells should come from the logged prefix and K only.
+    model_seed = int(base_model_seed + world_index)
     for stream_index in range(n_streams):
         progress.set_postfix_str(
             f"world={world_index + 1} stream={stream_index + 1}/{n_streams} sampling {max(n_list)} rounds"
@@ -196,16 +199,9 @@ def run_world(
             progress_desc=f"w{world_index + 1} stream {stream_index + 1}/{n_streams} logging",
             show_progress=True,
         )
-        for n_index, n in enumerate(n_list):
+        for n in n_list:
             prefix = build_feedback_prefix(full_stream, n)
             for kmeans_k in k_grid[n]:
-                model_seed = int(
-                    base_model_seed
-                    + world_index * 1_000_000
-                    + stream_index * 100_000
-                    + n_index * 1_000
-                    + kmeans_k
-                )
                 labels = labels_by_k[kmeans_k]
                 progress.set_postfix_str(
                     f"world={world_index + 1} stream={stream_index + 1}/{n_streams} n={n} K={kmeans_k}"
